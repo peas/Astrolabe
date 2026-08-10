@@ -1,0 +1,85 @@
+# Astrolabe — diagnostics. Optional.
+#
+# You do not normally want this. Add it when you are:
+#   - watching a fresh install for a while
+#   - working out why something feels slow or restarts
+#   - reporting a problem (the numbers here make it much easier to narrow down)
+#
+# Add one more entry under `packages:` in your device YAML:
+#
+#   packages:
+#     astrolabe:
+#       url: https://github.com/Khronos31/Astrolabe
+#       ref: v0.1.0
+#       file: packages/m5dial.yaml
+#       refresh: never
+#     astrolabe_diagnostics:      # <- this
+#       url: https://github.com/Khronos31/Astrolabe
+#       ref: v0.1.0
+#       file: packages/diagnostics.yaml
+#       refresh: never
+#
+# Leaving it out is genuinely smaller, not just quieter: ESPHome strips log
+# calls below the configured level at compile time, so the verbose strings are
+# absent from the binary rather than skipped at runtime.
+
+logger:
+  # Back to the ESPHome default. Without this the detailed logs below never
+  # reach the binary.
+  level: DEBUG
+
+debug:
+  # Sixty seconds. Shorter intervals mostly fill your Home Assistant history
+  # with diagnostic values.
+  update_interval: 60s
+
+sensor:
+  - platform: debug
+    free:
+      name: Heap Free
+      entity_category: diagnostic
+    block:
+      name: Heap Max Block
+      entity_category: diagnostic
+    loop_time:
+      # This is the *maximum* loop time seen since the last update, reset each
+      # time, not an average. It is meant for spotting occasional stalls; do
+      # not read a single high value as "the device is slow".
+      name: Loop Time
+      entity_category: diagnostic
+
+  # ── Touch panel health ──
+  # Known unresolved problem: after a few days idle, touch input can stop
+  # working while the display, the knob and the button keep working.
+  # Unplugging and replugging power brings it back. This is not fixed.
+  # What follows only makes the failure observable.
+  - platform: template
+    name: Touch G_CTRL
+    id: astrolabe_touch_g_ctrl
+    entity_category: diagnostic
+    # Read-back of touch controller register 0x86. Normally 0; -1 means the
+    # read itself failed.
+    lambda: 'return id(astrolabe_ui_id)->touch_g_ctrl();'
+    update_interval: 60s
+    accuracy_decimals: 0
+
+  - platform: template
+    name: Touch G_CTRL Bad Count
+    id: astrolabe_touch_g_ctrl_bad
+    entity_category: diagnostic
+    # Anything above zero means the failure above has happened at least once.
+    lambda: 'return id(astrolabe_ui_id)->touch_g_ctrl_bad();'
+    update_interval: 60s
+    accuracy_decimals: 0
+
+  - platform: template
+    name: Touch Poll Count
+    id: astrolabe_touch_polls
+    entity_category: diagnostic
+    # If this stops rising, the drawing task has stopped. Loop Time only tells
+    # you about ESPHome's own main loop, so without this a frozen screen can
+    # look perfectly healthy from Home Assistant.
+    lambda: 'return id(astrolabe_ui_id)->touch_g_ctrl_polls();'
+    update_interval: 60s
+    accuracy_decimals: 0
+    state_class: total_increasing

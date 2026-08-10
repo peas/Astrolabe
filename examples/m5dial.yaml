@@ -1,0 +1,70 @@
+# Astrolabe — turn an M5Dial into a Home Assistant controller.
+#
+# 1. Copy this file into your ESPHome configuration directory.
+# 2. Put wifi_ssid, wifi_password, api_encryption_key and ota_password in secrets.yaml.
+# 3. Replace the entries under `slots:` with your own entities.
+# 4. Build and install with ESPHome.
+# 5. After adding the device to Home Assistant, open the ESPHome integration's
+#    options for it and enable "Allow the device to perform Home Assistant actions".
+#    Without this the screen looks fine but nothing happens when you use it, and
+#    the device is not told why. Home Assistant reports it under Repairs.
+
+substitutions:
+  name: astrolabe
+  friendly_name: Astrolabe
+
+packages:
+  astrolabe:
+    url: https://github.com/Khronos31/Astrolabe
+    ref: v0.1.0
+    file: packages/m5dial.yaml
+    # Pinned to a tag, so there is nothing to re-fetch. Keep `never`.
+    refresh: never
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  # This device is mains-powered and always on, so there is nothing to save.
+  # With the default (WIFI_PS_MIN_MODEM) the radio sleeps between DTIM beacons
+  # and the dial feels noticeably sluggish: round-trip median 125-180 ms and
+  # peaks over 2 s, against 8 ms and 51 ms with power saving off.
+  # Change this if you build a battery-powered variant.
+  power_save_mode: none
+
+api:
+  # homeassistant_states and homeassistant_services are enabled by the package.
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+astrolabe_ui:
+  # Whether to beep on input. Set to false if the device sits by your bed.
+  sound: true
+
+  # The order here is the order around the ring. Ten slots maximum;
+  # more than that fails at build time rather than overlapping on screen.
+  slots:
+    - type: light
+      entity_id: light.living_room
+      tag_up: "LIVING"
+      tag_down: "LIGHT"
+      icon: mdi:lightbulb
+    - type: light
+      entity_id: light.bedroom
+      tag_up: "BED"
+      tag_down: "ROOM"
+      icon: mdi:bed
+
+# ── Optional: diagnostics ──
+# Add one more entry under `packages:` to expose heap, loop time, touch health
+# and verbose logs. Leave it out for normal use; the verbose log strings are
+# removed at compile time, so this is smaller as well as quieter.
+#
+#     astrolabe_diagnostics:
+#       url: https://github.com/Khronos31/Astrolabe
+#       ref: v0.1.0
+#       file: packages/diagnostics.yaml
+#       refresh: never

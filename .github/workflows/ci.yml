@@ -1,0 +1,107 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  schedule:
+    # Weekly. This is the part that matters: the pinned dependencies are fetched
+    # at build time and ESPHome has no upper version bound, so nothing here is
+    # frozen in practice. A build that only runs on push would go stale silently.
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build the example
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install ESPHome
+        run: pip install esphome
+
+      - name: Record the ESPHome version
+        run: |
+          esphome version
+          echo "ESPHOME_VERSION=$(esphome version | sed -n 's/^Version: //p')" >> "$GITHUB_ENV"
+
+      - name: Build the example exactly as published
+        # The YAML printed in README.md is generated from examples/m5dial.yaml,
+        # and a separate step below checks they still match. Building this file
+        # is therefore building what a reader would copy.
+        #
+        # Only the source of the component is redirected, to this checkout
+        # instead of a tag: on a pull request the tag does not yet contain the
+        # change being tested.
+        run: |
+          mkdir -p build && cd build
+          python - <<'PY'
+          import base64, os, pathlib, re
+          src = pathlib.Path('../examples/m5dial.yaml').read_text()
+          src = re.sub(r"packages:\n  astrolabe:\n(?:    .*\n)+",
+                       "packages:\n  astrolabe: !include ../packages/m5dial.yaml\n", src)
+          src = src.replace("substitutions:\n  name: astrolabe",
+                            "substitutions:\n  astrolabe_source: ../components\n  name: astrolabe")
+          pathlib.Path('astrolabe.yaml').write_text(src)
+          key = base64.b64encode(os.urandom(32)).decode()
+          pathlib.Path('secrets.yaml').write_text(
+              'wifi_ssid: "ci-network"\n'
+              'wifi_password: "ci-password"\n'
+              f'api_encryption_key: "{key}"\n'
+              'ota_password: "ci-ota-password"\n')
+          PY
+          esphome config astrolabe.yaml
+          esphome compile astrolabe.yaml
+
+      - name: Build with diagnostics as well
+        # Diagnostics are optional, so nothing else would catch a break here.
+        run: |
+          cd build
+          python - <<'PY'
+          import pathlib
+          p = pathlib.Path('astrolabe.yaml')
+          p.write_text(p.read_text().replace(
+              "packages:\n  astrolabe: !include ../packages/m5dial.yaml\n",
+              "packages:\n  astrolabe: !include ../packages/m5dial.yaml\n"
+              "  astrolabe_diagnostics: !include ../packages/diagnostics.yaml\n"))
+          PY
+          esphome config astrolabe.yaml
+          esphome compile astrolabe.yaml
+
+      - name: Check that README still prints the example verbatim
+        # If these drift, the YAML people copy is not the YAML that was built.
+        run: |
+          python - <<'PY'
+          import pathlib, re, sys
+          readme = pathlib.Path('README.md').read_text()
+          example = pathlib.Path('examples/m5dial.yaml').read_text()
+          block = re.search(r"```yaml\n(.*?)```\n", readme, re.S)
+          if block is None:
+              sys.exit("README.md has no yaml block")
+          if block.group(1) != example:
+              sys.exit("README.md and examples/m5dial.yaml have drifted apart")
+          print("README matches examples/m5dial.yaml")
+          PY
+
+      - name: Check that "last verified" is not older than what we just built
+        # README says "or newer (last verified: X)". If CI builds a newer
+        # ESPHome and X is not updated, the README claims something nobody
+        # checked. Failing here is the reminder to update it.
+        run: |
+          python - <<'PY'
+          import os, pathlib, re, sys
+          readme = pathlib.Path('README.md').read_text()
+          m = re.search(r"last verified: ([0-9]+\.[0-9]+\.[0-9]+)", readme)
+          if m is None:
+              sys.exit("README.md has no 'last verified' marker")
+          claimed, built = m.group(1), os.environ["ESPHOME_VERSION"]
+          print(f"README claims {claimed}; CI built {built}")
+          if claimed != built:
+              sys.exit(
+                  f"README says 'last verified: {claimed}' but this build used "
+                  f"{built}. Update the README, having checked it on hardware.")
+          PY
