@@ -158,7 +158,7 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
   /** ⚠️ **届かなかったときの音。** 低く長い——「効いた」と聞き分けられないと、
    * 繋がっていないことに気づけない。 */
   static constexpr uint32_t BEEP_HZ_OFFLINE = 800;
-  /** `generic` が結果を出しておく時間。 */
+  /** `generic` が「いま反応した」を見せておく時間。 */
   static constexpr uint32_t GENERIC_RESULT_MS = 1200;
 
   /** ランチャーで「開く」と見なす中央円の半径。
@@ -233,12 +233,19 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
     GestureTarget gestures[static_cast<int>(Gesture::COUNT)];
   };
 
-  /** `generic` の画面。**状態を持たないアプリ**なので、出せるのは「撃った」ことだけ。 */
-  enum class GenericResult : uint8_t { IDLE, SENT, OFFLINE };
-
+  /** `generic` の画面の直後の状態。
+   *
+   * ⚠️ **「送った」ではなく「どのジェスチャとして受け取ったか」を出す。**
+   * `call_homeassistant_service` は結果を返さないので「効いた」は言えず、
+   * 「送った」は利用者の知りたいことに答えていない。答えられるのは
+   * **こちらがどう解釈したか**で、⚠️ **実際に起きる取り違えもそこ**——
+   * タップのつもりが長押しになる（閾値500ms）。 */
   struct GenericAppState {
-    GenericResult result;
-    uint32_t result_at_ms;
+    /** 直前に撃ったもの。`Gesture::COUNT` ＝ 何も撃っていない。 */
+    Gesture fired;
+    /** ⚠️ 届いていない。**確実に知っていること**なので、はっきり出す。 */
+    bool offline;
+    uint32_t at_ms;
   };
 
   /** 調光画面の編集中の値。⚠️ **描画タスクの持ち物**——
@@ -323,9 +330,9 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
   /** 調光画面での入力。⚠️ 描画タスクからのみ。 */
   void light_app_input_(Input in, uint32_t now);
   /** `generic` のジェスチャを撃つ。⚠️ **設定されていなければ何もせず、鳴らさない。**
-   * @param show_result タップ・長押しは結果を出す。**回転は出さない**——
-   *        連続操作なので、結果画面を挟むと回し続けられない。 */
-  void fire_gesture_(Gesture g, uint32_t now, bool show_result);
+   * ⚠️ **回転でも案内を光らせる**——語が明るくなるだけなら回し続ける邪魔にならない
+   * （「結果画面を挟むと回せない」という理由には当たらない）。 */
+  void fire_gesture_(Gesture g, uint32_t now);
   /** 間引きつきの送信。⚠️ 積むだけで、呼ぶのはメインループ。 */
   void light_app_publish_(uint32_t now, bool force);
   void on_ha_state_(std::string entity_id, std::string state);

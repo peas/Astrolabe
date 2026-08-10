@@ -489,6 +489,8 @@ bool AstrolabeUI::open_app_(int index, uint32_t now) {
     case SlotType::GENERIC: {
       /* ⚠️ **状態を持たないアプリ。** 購読も無く、開いた時点で出すものは見出しだけ。 */
       this->generic_app_ = GenericAppState{};
+      /* ⚠️ ゼロ値は `Gesture::TAP`。**「何も撃っていない」を明示する。** */
+      this->generic_app_.fired = Gesture::COUNT;
       this->app_slot_ = index;
       this->set_screen_(Screen::APP);
       this->last_activity_ms_ = now;
@@ -560,7 +562,7 @@ void AstrolabeUI::light_app_input_(Input in, uint32_t now) {
 
 void AstrolabeUI::on_touch_long_(uint32_t now) {
   if (this->app_slot_ >= 0 && this->slots_[this->app_slot_].type == SlotType::GENERIC) {
-    this->fire_gesture_(Gesture::HOLD, now, /*show_result=*/true);
+    this->fire_gesture_(Gesture::HOLD, now);
     return;
   }
   if (!this->light_ct_available_(this->app_slot_, nullptr, nullptr)) {
@@ -618,7 +620,7 @@ void AstrolabeUI::beep_(uint32_t hz, uint32_t ms) {
   xQueueSend(this->action_queue_, &a, 0);
 }
 
-void AstrolabeUI::fire_gesture_(Gesture g, uint32_t now, bool show_result) {
+void AstrolabeUI::fire_gesture_(Gesture g, uint32_t now) {
   if (this->app_slot_ < 0) {
     return;
   }
@@ -645,11 +647,11 @@ void AstrolabeUI::fire_gesture_(Gesture g, uint32_t now, bool show_result) {
   this->beep_(online ? BEEP_HZ_ACTION : BEEP_HZ_OFFLINE, online ? BEEP_MS : BEEP_MS_MODE);
   this->last_activity_ms_ = now;
 
-  if (show_result) {
-    /* ⚠️ **回転では出さない。** 連続操作なので、結果画面を挟むと回し続けられない。 */
-    this->generic_app_.result = (online && queued) ? GenericResult::SENT : GenericResult::OFFLINE;
-    this->generic_app_.result_at_ms = now;
-  }
+  /* ⚠️ **撃ったジェスチャを覚える。** 画面はこれを見て案内の語を光らせる。
+     回転でも覚える——語が明るくなるだけなら、回し続ける邪魔にならない。 */
+  this->generic_app_.fired = g;
+  this->generic_app_.offline = !(online && queued);
+  this->generic_app_.at_ms = now;
 }
 
 void AstrolabeUI::app_input_(Input in, uint32_t now) {
@@ -662,8 +664,7 @@ void AstrolabeUI::app_input_(Input in, uint32_t now) {
       this->light_app_input_(in, now);
       return;
     case SlotType::GENERIC:
-      this->fire_gesture_(in == Input::ROTATE_CW ? Gesture::ROTATE_RIGHT : Gesture::ROTATE_LEFT, now,
-                          /*show_result=*/false);
+      this->fire_gesture_(in == Input::ROTATE_CW ? Gesture::ROTATE_RIGHT : Gesture::ROTATE_LEFT, now);
       return;
     case SlotType::CLIMATE:
     case SlotType::COVER:
@@ -803,7 +804,7 @@ void AstrolabeUI::on_touch_short_(uint32_t now) {
 
     case Screen::APP:
       if (this->app_slot_ >= 0 && this->slots_[this->app_slot_].type == SlotType::GENERIC) {
-        this->fire_gesture_(Gesture::TAP, now, /*show_result=*/true);
+        this->fire_gesture_(Gesture::TAP, now);
         return;
       }
       /* アプリの中でのタップはトグル。 */
@@ -969,9 +970,10 @@ void AstrolabeUI::ui_task_() {
             this->last_clock_render_ms_ = now - CLOCK_RENDER_MS;
             break;
           }
-          if (this->generic_app_.result != GenericResult::IDLE &&
-              now - this->generic_app_.result_at_ms >= GENERIC_RESULT_MS) {
-            this->generic_app_.result = GenericResult::IDLE;
+          if (this->generic_app_.fired != Gesture::COUNT &&
+              now - this->generic_app_.at_ms >= GENERIC_RESULT_MS) {
+            this->generic_app_.fired = Gesture::COUNT;
+            this->generic_app_.offline = false;
           }
           {
             const auto &slot = this->slots_[this->app_slot_];
@@ -979,7 +981,8 @@ void AstrolabeUI::ui_task_() {
             GenericView view{};
             view.tag_up = &tags.tag_up;
             view.tag_down = &tags.tag_down;
-            view.result = static_cast<uint8_t>(this->generic_app_.result);
+            view.fired = static_cast<uint8_t>(this->generic_app_.fired);
+            view.offline = this->generic_app_.offline;
             view.has_tap = !slot.gestures[static_cast<int>(Gesture::TAP)].service.empty();
             view.has_hold = !slot.gestures[static_cast<int>(Gesture::HOLD)].service.empty();
             view.has_rotate = !slot.gestures[static_cast<int>(Gesture::ROTATE_RIGHT)].service.empty() ||
