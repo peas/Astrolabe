@@ -68,6 +68,13 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
      直接 `tp_` を触ると、所有の約束に例外ができる。
      用途: 放置でタッチだけ死ぬ故障の観測。既知の未解決問題で、根治していない。 */
 
+  /** いま焼き込まれているスロットの数。
+   * ⚠️ **起動ログを取り逃しても分かるようにするための口。** `dump_config` にも出るが、
+   * それは起動時にしか流れず、**ログクライアントが繋がる前に終わっている**
+   * （実際にこれで2回取り逃した）。**値として出しておけば後からでも読める。**
+   * ⚠️ `slots_` は `setup()` より前に埋まり、以後変わらない。だからロックは要らない。 */
+  int slot_count() const { return static_cast<int>(this->slots_.size()); }
+
   /** 直近に読み返した G_CTRL。`-1` ＝ 読めなかった。**正常時は 0**。 */
   int touch_g_ctrl() const { return this->g_ctrl_last_.load(); }
   /** 起動直後の G_CTRL。⚠️ 起動時から異常なのか、動作中に化けたのかを分ける。 */

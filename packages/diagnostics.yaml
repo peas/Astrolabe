@@ -33,7 +33,39 @@ debug:
   # with diagnostic values.
   update_interval: 60s
 
+text_sensor:
+  # Which build is actually running, and why it last restarted.
+  #
+  # These exist because the boot banner is easy to miss: it is written before a
+  # log client can attach, so "which firmware is this?" is exactly the question
+  # you cannot answer from the logs after the fact. As values in Home Assistant
+  # they survive the race.
+  - platform: template
+    name: Build
+    id: astrolabe_build
+    entity_category: diagnostic
+    icon: mdi:package-variant-closed
+    # Set when this build was compiled. Two builds of the same ESPHome version
+    # are otherwise indistinguishable from Home Assistant.
+    lambda: 'return {std::string(__DATE__ " " __TIME__)};'
+    update_interval: 300s
+
+  - platform: debug
+    reset_reason:
+      name: Reset Reason
+      entity_category: diagnostic
+
 sensor:
+  - platform: template
+    name: Slots
+    id: astrolabe_slots
+    entity_category: diagnostic
+    # How many slots this firmware was built with. Compare against your YAML
+    # when the ring does not look the way you expect.
+    lambda: 'return id(astrolabe_ui_id)->slot_count();'
+    update_interval: 300s
+    accuracy_decimals: 0
+
   - platform: debug
     free:
       name: Heap Free

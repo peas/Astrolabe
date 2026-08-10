@@ -344,6 +344,7 @@ namespace FT3267
                    放置中（_idle_loop）も通るので、見張りたい時間帯がちょうど覆える。 */
                 _poll_g_ctrl();
 
+
                 _data_buffer[0] = 0;
                 if (!_read_reg(FT5x06_TOUCH_POINTS, 1))
                 {
