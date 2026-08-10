@@ -75,6 +75,16 @@ jobs:
           esphome config astrolabe.yaml
           esphome compile astrolabe.yaml
 
+      - name: Run the host tests
+        # HaRange decides whether a number from Home Assistant may be shown and
+        # whether it may be sent back. It has no hardware in it, so it can be
+        # tested here — which matters, because the cases that make it necessary
+        # are hard to produce on a device: a light reporting a value outside its
+        # own stated range, or an attribute vanishing at the wrong moment.
+        run: |
+          g++ -std=c++17 -Wall -Wextra -Werror -o /tmp/test_ha_value tests/test_ha_value.cpp
+          /tmp/test_ha_value
+
       - name: Check that README still prints the example verbatim
         # If these drift, the YAML people copy is not the YAML that was built.
         run: |
