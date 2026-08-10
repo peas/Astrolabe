@@ -208,11 +208,22 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
   struct LightAppState {
     int brightness;
     LightMode mode;
-    /** 編集中の色温度（K）。⚠️ **`-1` ＝ 確からしい値を知らない。**
-     * `brightness` の `-1` と同じ作法だが、こちらにはもう一段強い意味がある——
-     * **知らない値を Home Assistant へ送り返さない**ため。範囲外の値を丸めて
-     * 「知っている」ことにすると、点けた瞬間に**利用者が選んでいない色**になる。 */
+    /** 画面に出す色温度（K）。範囲が分かっていれば**必ず範囲内に丸めてある**。
+     * `-1` ＝ **値そのものが無い**（属性が届いていない・`None` が来た）。 */
     int color_temp;
+    /** ⚠️ **上の値を Home Assistant へ送り返してよいか。**
+     *
+     * 表示と送信を分けてある。**丸めた値は見せてよいが、送ってはいけない**——
+     * 丸めは「たぶんこの辺」という推測であって、利用者が選んだ値ではない。
+     *
+     * ⚠️ 実例: あるライトはトグルで点け直すたび `color_temp_kelvin: 65280` を報告する。
+     * 実物は最大色温度になっているので**丸めた表示は正しい**が、
+     * **65280 が常に「最大」を意味する保証はどこにもない**——それはその統合の癖であって、
+     * 別のライトで同じとは限らない。だから見せるだけにする。
+     *
+     * `true` になるのは、**利用者がノブを回したとき**と、
+     * **HAが範囲内の値を報告したとき**だけ。 */
+    bool color_temp_known;
     bool is_on;
     bool state_received;
     uint32_t last_local_change_ms;
@@ -308,10 +319,12 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
   /** HAから届いた明るさ 0-255。`-1` ＝ **まだ一度も届いていない**。
    * ⚠️ **0 と区別する**——0は「点いているが最小」、-1は「知らない」。 */
   std::atomic<int16_t> brightness_[SLOTS_MAX];
-  /** HAから届いた色温度（K）。`-1` ＝ **まだ確からしい値を知らない**。
+  /** HAから届いた色温度（K）を**そのまま**。`-1` ＝ 値が無い（`None` など）。
    * ⚠️ **範囲での検査は使う側で行う**——属性は別々に届くので、
-   * 値が先に来て範囲が後から来ることがある。 */
-  std::atomic<int16_t> color_temp_[SLOTS_MAX];
+   * 値が先に来て範囲が後から来ることがある。
+   * ⚠️ **`int32_t` なのは、範囲外の大きな値を落とさずに持つため**。
+   * `int16_t` だと 65280 のような実在する報告値が溢れて別の数に化ける。 */
+  std::atomic<int32_t> color_temp_[SLOTS_MAX];
   std::atomic<int16_t> ct_min_[SLOTS_MAX];
   std::atomic<int16_t> ct_max_[SLOTS_MAX];
   /** ⚠️ **いま色温度に対応しているか。** `supported_color_modes` が届くたび作り直す——

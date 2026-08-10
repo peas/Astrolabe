@@ -84,7 +84,7 @@ substitutions:
 packages:
   astrolabe:
     url: https://github.com/Khronos31/Astrolabe
-    ref: v0.1.1
+    ref: v0.1.2
     file: packages/m5dial.yaml
     # Pinned to a tag, so there is nothing to re-fetch. Keep `never`.
     refresh: never
@@ -134,7 +134,7 @@ astrolabe_ui:
 #
 #     astrolabe_diagnostics:
 #       url: https://github.com/Khronos31/Astrolabe
-#       ref: v0.1.1
+#       ref: v0.1.2
 #       file: packages/diagnostics.yaml
 #       refresh: never
 ```
@@ -172,9 +172,13 @@ takes the mode away without a rebuild.
 Colour temperature can only be set by turning a light on, so turning the knob
 in `CLR` while the light is off will switch it on.
 
-When Astrolabe has not been told a usable colour temperature yet, the screen
-shows `----K` and draws no arc, and turning the light on will not send one. It
-does not guess a value and send that back to you.
+Some lights report a colour temperature outside their own stated range. One
+ceiling light here reports `65280` every time it is switched on. Astrolabe
+shows the nearest end of the range, because that is usually what the light has
+actually done — but it will not send that number back until you have turned
+the knob yourself. Showing a guess is fine; acting on one is not.
+
+If there is no value at all, the screen shows `----K` and draws no arc.
 
 Sounds tell you what the device thinks you did, without looking at it:
 

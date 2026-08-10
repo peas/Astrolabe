@@ -60,7 +60,7 @@ void AstrolabeUI::setup() {
     b.store(-1);  /* ⚠️ 0ではない。「まだ知らない」を0%と混ぜない。 */
   }
   for (auto &c : this->color_temp_) {
-    c.store(-1);
+    c.store(-1);  /* ⚠️ 「値が無い」。0 と混ぜない。 */
   }
   for (auto &c : this->ct_min_) {
     c.store(-1);
@@ -224,15 +224,33 @@ int AstrolabeUI::slot_index_(const std::string &entity_id) const {
  *
  * @return 読めなければ `-1`
  */
-static int16_t parse_kelvin_(const std::string &value) {
+static int32_t parse_kelvin_(const std::string &value) {
   char *end = nullptr;
   const long v = strtol(value.c_str(), &end, 10);
-  /* 照明の色温度としてありうる幅。ここを通っても、
-     そのライトの min/max に収まっているかは**使う側で**もう一度見る。 */
-  if (end == value.c_str() || v < 1000 || v > 20000) {
+  /* ⚠️ **ここでは丸めない。** 範囲は別の属性で遅れて届くので、収まっているかの判断は
+     使う側でやる。`None` のように数として読めないものだけを弾く。 */
+  if (end == value.c_str() || v <= 0 || v > 1000000) {
     return -1;
   }
-  return static_cast<int16_t>(v);
+  return static_cast<int32_t>(v);
+}
+
+/** 生の報告値を「画面に出す値」と「送り返してよいか」に分ける。
+ *
+ * ⚠️ **丸めた値は見せてよいが、送ってはいけない。** 丸めは「たぶんこの辺」という推測で、
+ * 利用者が選んだ値ではない。実物と一致することもあるが、それは統合側の癖に依存する。
+ *
+ * @param display 画面に出す値。`-1` ＝ 値そのものが無い
+ * @param known   Home Assistant へ送り返してよいか
+ */
+static void ct_view_(int32_t raw, int lo, int hi, int *display, bool *known) {
+  if (raw < 0) {
+    *display = -1;
+    *known = false;
+    return;
+  }
+  *known = (raw >= lo && raw <= hi);
+  *display = *known ? static_cast<int>(raw) : (raw < lo ? lo : hi);
 }
 
 void AstrolabeUI::on_ha_color_temp_(std::string entity_id, std::string value) {
@@ -240,14 +258,15 @@ void AstrolabeUI::on_ha_color_temp_(std::string entity_id, std::string value) {
   if (i < 0) {
     return;
   }
-  const int16_t k = parse_kelvin_(value);
+  const int32_t k = parse_kelvin_(value);
   this->color_temp_[i].store(k);
   if (k < 0) {
-    ESP_LOGW(TAG, "%s.color_temp_kelvin: '%s' is not a usable value; treating as unknown",
+    ESP_LOGW(TAG, "%s.color_temp_kelvin: '%s' is not a number; treating as absent",
              entity_id.c_str(), value.c_str());
     return;
   }
-  ESP_LOGD(TAG, "%s.color_temp_kelvin -> %d", entity_id.c_str(), k);
+  /* ⚠️ 範囲に収まっているかはここで見ない（範囲が遅れて届くため）。使う側で分ける。 */
+  ESP_LOGD(TAG, "%s.color_temp_kelvin -> %d", entity_id.c_str(), static_cast<int>(k));
 }
 
 void AstrolabeUI::on_ha_ct_min_(std::string entity_id, std::string value) {
@@ -406,16 +425,14 @@ bool AstrolabeUI::open_app_(int index, uint32_t now) {
       /* ⚠️ **開くときは必ず明るさから。** 色温度は長押しで行く場所であって、
          前回どちらにいたかを覚えていると「開いたら知らない画面だった」になる。 */
       this->light_app_.mode = LightMode::DIMMER;
-      /* ⚠️ **範囲に収まっていない値は受け取らない。** 収まっていないのは
-         「知らない」であって、端に丸めてよい値ではない。 */
+      /* ⚠️ **範囲外は端へ丸めて「見せる」が、「送ってよい」とはしない。** */
       this->light_app_.color_temp = -1;
+      this->light_app_.color_temp_known = false;
       int ct_lo = 0;
       int ct_hi = 0;
       if (this->light_ct_available_(index, &ct_lo, &ct_hi)) {
-        const int16_t ct = this->color_temp_[index].load();
-        if (ct >= ct_lo && ct <= ct_hi) {
-          this->light_app_.color_temp = ct;
-        }
+        ct_view_(this->color_temp_[index].load(), ct_lo, ct_hi, &this->light_app_.color_temp,
+                 &this->light_app_.color_temp_known);
       }
       this->app_slot_ = index;
       this->set_screen_(Screen::APP);
@@ -443,8 +460,8 @@ void AstrolabeUI::light_app_input_(Input in, uint32_t now) {
       this->light_ct_available_(this->app_slot_, &ct_lo, &ct_hi)) {
     int ct = this->light_app_.color_temp;
     if (ct < ct_lo || ct > ct_hi) {
-      /* ⚠️ **知らない値からは刻まない。** 最初の一手は範囲の真ん中に置く——
-         ここから先は利用者が選んだ値なので、送ってよくなる。 */
+      /* 値そのものが無いときだけ、最初の一手を範囲の真ん中に置く。
+         ⚠️ 範囲外の報告は既に端へ丸めて表示しているので、通常ここへは来ない。 */
       ct = (ct_lo + ct_hi) / 2;
     } else {
       ct += up ? COLOR_TEMP_STEP : -COLOR_TEMP_STEP;
@@ -456,6 +473,8 @@ void AstrolabeUI::light_app_input_(Input in, uint32_t now) {
       ct = ct_lo;
     }
     this->light_app_.color_temp = ct;
+    /* ⚠️ **回した時点で「利用者が選んだ値」になる。** ここから先は送ってよい。 */
+    this->light_app_.color_temp_known = true;
     /* ⚠️ **色温度を送ると、消えていれば点く**（`light.turn_on` しか手段が無い）。
        画面の側も点いた前提に揃えておく——HAのこだまを待つと2秒ちらつく。 */
     this->light_app_.is_on = true;
@@ -519,7 +538,7 @@ void AstrolabeUI::light_app_publish_(uint32_t now, bool force) {
   a.is_on = this->light_app_.is_on;
   /* ⚠️ **知らない色温度は添えない。** 明るさの面にいるときも添えない——
      いま利用者がいじっているのはそちらではない。 */
-  a.color_temp = (this->light_app_.mode == LightMode::COLOR_TEMP)
+  a.color_temp = (this->light_app_.mode == LightMode::COLOR_TEMP && this->light_app_.color_temp_known)
                      ? static_cast<int16_t>(this->light_app_.color_temp)
                      : -1;
   xQueueSend(this->action_queue_, &a, 0);
@@ -855,11 +874,8 @@ void AstrolabeUI::ui_task_() {
           }
 
           if (ct_ok && now - this->light_app_.last_local_change_ms >= LOCAL_CHANGE_GUARD_MS) {
-            const int16_t ct = this->color_temp_[this->app_slot_].load();
-            /* ⚠️ 範囲外は取り込まない（丸めない）。 */
-            if (ct >= ct_lo && ct <= ct_hi) {
-              this->light_app_.color_temp = ct;
-            }
+            ct_view_(this->color_temp_[this->app_slot_].load(), ct_lo, ct_hi,
+                     &this->light_app_.color_temp, &this->light_app_.color_temp_known);
           }
 
           this->light_app_publish_(now, /*force=*/false);
