@@ -35,13 +35,25 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
  public:
   /** スロットの種別。⚠️ **Python側 `SLOT_TYPES` と一緒に増やす。**
    * ⚠️ 数値をYAMLの見た目の順に依存させない——codegen が名前で渡す。 */
-  enum class SlotType : uint8_t { LIGHT = 0 };
+  enum class SlotType : uint8_t { LIGHT = 0, CLIMATE = 1, COVER = 2, MEDIA_PLAYER = 3, GENERIC = 4 };
+
+  /** `generic` スロットのジェスチャ。⚠️ **Python側 `GESTURES` と一緒に増やす。**
+   * ⚠️ 名前は利用者が書くYAMLのキーそのもの——`press_` を付けないのは、
+   * **ノブのボタンが「戻る」に割り当て済み**で混同するため。 */
+  enum class Gesture : uint8_t { TAP = 0, HOLD = 1, ROTATE_RIGHT = 2, ROTATE_LEFT = 3, COUNT = 4 };
 
   /** codegen から呼ばれる。**setup() より前に全件揃う。**
    * @param icon 42x42 の RGB565（**バイト入れ替え済み**）。フラッシュ常駐で、所有しない。
    *        ⚠️ 入れ替えの理屈は `icons.py` の `render_icon` の注意を読むこと。 */
   void add_slot(uint8_t type, const std::string &entity_id, const std::string &tag_up, const std::string &tag_down,
                 int x, int y, const uint16_t *icon);
+
+  /** `generic` スロットのジェスチャに、呼ぶサービスと対象を結び付ける。
+   *
+   * ⚠️ **サービス名はPython側で解決済み**（`"script.turn_on"` のような完全な名前）。
+   * C++側に表を持たせない——表がPython側にあれば、**押せない組み合わせはビルドで落ちる**。
+   * ⚠️ `add_slot` の**あと**に呼ばれる（codegenがその順で出す）。 */
+  void add_gesture(int slot, uint8_t gesture, const std::string &service, const std::string &entity_id);
 
   void setup() override;
   void loop() override;
@@ -90,6 +102,9 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
    * 状態機械はそのフレームを捨てているので、**この数が伸びること自体は異常ではない**。
    * 急に増えたら、バスか配線の方を疑う手がかりになる。 */
   int touch_read_fails() const { return this->tp_read_fail_.load(); }
+  /** ⚠️ **キューが詰まって捨てた操作の回数。** 0でなければ、押した/回した回数と
+   * Home Assistant が受けた回数が食い違っている。 */
+  int dropped_actions() const { return this->dropped_actions_.load(); }
 
  protected:
   /** リングに置ける上限。⚠️ **Python側 `ring.py` の `SLOTS_MAX` と一致させること。** */
@@ -140,6 +155,11 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
   static constexpr uint32_t BEEP_HZ_MODE = 3000;
   /** モード切替だけ長く鳴らす。**画面の意味が変わる**ので、他より重い手応えにする。 */
   static constexpr uint32_t BEEP_MS_MODE = 40;
+  /** ⚠️ **届かなかったときの音。** 低く長い——「効いた」と聞き分けられないと、
+   * 繋がっていないことに気づけない。 */
+  static constexpr uint32_t BEEP_HZ_OFFLINE = 800;
+  /** `generic` が結果を出しておく時間。 */
+  static constexpr uint32_t GENERIC_RESULT_MS = 1200;
 
   /** ランチャーで「開く」と見なす中央円の半径。
    * ⚠️ これが無いと**リング上のアイコンを触っただけで開く**。 */
@@ -175,7 +195,7 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
 
   /** 描画タスク → メインループ。**Home Assistant を呼ぶ意図。**
    * ⚠️ `SET_LIGHT` は `slot` と `brightness` を伴うので、単なる列挙ではなく構造体で渡す。 */
-  enum class ActionKind : uint8_t { TOGGLE_SLOT, SET_LIGHT, BEEP };
+  enum class ActionKind : uint8_t { TOGGLE_SLOT, SET_LIGHT, BEEP, CALL_GESTURE };
 
   struct Action {
     ActionKind kind;
@@ -189,7 +209,15 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
     /** `SET_LIGHT` のときに添える色温度（K）。⚠️ **`-1` ＝ 添えない。**
      * 既定値ではなく逃げ道——**利用者が選んでいない色温度を送り返さない**ため。 */
     int16_t color_temp;
+    /** `CALL_GESTURE` のときにどのジェスチャか。 */
+    uint8_t gesture;
     bool is_on;
+  };
+
+  /** ジェスチャの呼び先。⚠️ **`service` が空なら設定されていない。** */
+  struct GestureTarget {
+    std::string service;
+    std::string entity_id;
   };
 
   /** 調光画面のモード。⚠️ **長押しで行き来する。** */
@@ -197,9 +225,20 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
 
   struct SlotConfig {
     SlotType type;
+    /** ⚠️ **`generic` では空。** 空なら状態を購読しない。 */
     std::string entity_id;
     int x;
     int y;
+    /** ⚠️ `generic` 以外では全部空のまま。 */
+    GestureTarget gestures[static_cast<int>(Gesture::COUNT)];
+  };
+
+  /** `generic` の画面。**状態を持たないアプリ**なので、出せるのは「撃った」ことだけ。 */
+  enum class GenericResult : uint8_t { IDLE, SENT, OFFLINE };
+
+  struct GenericAppState {
+    GenericResult result;
+    uint32_t result_at_ms;
   };
 
   /** 調光画面の編集中の値。⚠️ **描画タスクの持ち物**——
@@ -279,8 +318,14 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
   /** 手応えを鳴らす意図を積む。⚠️ **描画タスクから直接 output を触らない**——
    * ESPHomeのコンポーネントはメインループの持ち物。積むだけにする。 */
   void beep_(uint32_t hz, uint32_t ms = BEEP_MS);
+  /** 開いているアプリへ入力を渡す。⚠️ **種別で分岐するのはここ1箇所。** */
+  void app_input_(Input in, uint32_t now);
   /** 調光画面での入力。⚠️ 描画タスクからのみ。 */
   void light_app_input_(Input in, uint32_t now);
+  /** `generic` のジェスチャを撃つ。⚠️ **設定されていなければ何もせず、鳴らさない。**
+   * @param show_result タップ・長押しは結果を出す。**回転は出さない**——
+   *        連続操作なので、結果画面を挟むと回し続けられない。 */
+  void fire_gesture_(Gesture g, uint32_t now, bool show_result);
   /** 間引きつきの送信。⚠️ 積むだけで、呼ぶのはメインループ。 */
   void light_app_publish_(uint32_t now, bool force);
   void on_ha_state_(std::string entity_id, std::string state);
@@ -339,6 +384,15 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
   std::atomic<uint16_t> g_ctrl_bad_{0};
   std::atomic<uint32_t> g_ctrl_polls_{0};
   std::atomic<uint16_t> tp_read_fail_{0};
+  /** ⚠️ **APIが繋がっているか。** メインループが書き、描画タスクが読む。
+   * `generic` は状態を持たないアプリなので、出せるのは「撃った」ことだけ——
+   * ⚠️ **`call_homeassistant_service` は撃ちっぱなしで結果が返らない**ので、
+   * 「効いた」とは言えない。言えるのは「送った」と「そもそも繋がっていない」の2つだけ。 */
+  std::atomic<bool> api_connected_{false};
+  /** ⚠️ **キューへ積めずに捨てた回数。** `light` なら1目盛り落ちても見えないが、
+   * `generic` は **1目盛り＝1回の呼び出し**なので、落ちた分だけ実行されない。
+   * **黙って落とさない**ために数える。 */
+  std::atomic<uint16_t> dropped_actions_{0};
 
   /** 描画タスク → メインループ（Home Assistant を呼ぶ意図）。 */
   QueueHandle_t action_queue_{nullptr};
@@ -362,6 +416,7 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
   /** `Screen::APP` のとき、どのスロットを開いているか。 */
   int app_slot_{-1};
   LightAppState light_app_{};
+  GenericAppState generic_app_{};
 };
 
 }  // namespace astrolabe_ui

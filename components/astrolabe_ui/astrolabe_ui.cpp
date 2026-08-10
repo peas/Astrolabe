@@ -7,6 +7,7 @@
 #include "esphome/core/log.h"
 
 #include "clock_render.hpp"
+#include "generic_render.hpp"
 #include "light_render.hpp"
 
 namespace esphome {
@@ -44,6 +45,20 @@ void AstrolabeUI::add_slot(uint8_t type, const std::string &entity_id, const std
   rs.tag_down = tag_down;
   rs.icon = icon;
   this->render_slots_.push_back(std::move(rs));
+}
+
+void AstrolabeUI::add_gesture(int slot, uint8_t gesture, const std::string &service,
+                              const std::string &entity_id) {
+  /* ⚠️ codegen が `add_slot` のあとに出すので、ここへ来る時点でスロットは存在する。
+     それでも見るのは、**存在しない添字で書き込む方が、黙って効かないより悪い**から。 */
+  if (slot < 0 || slot >= static_cast<int>(this->slots_.size()) ||
+      gesture >= static_cast<uint8_t>(Gesture::COUNT)) {
+    ESP_LOGE(TAG, "gesture %u for slot %d has nowhere to go", gesture, slot);
+    return;
+  }
+  auto &target = this->slots_[slot].gestures[gesture];
+  target.service = service;
+  target.entity_id = entity_id;
 }
 
 void AstrolabeUI::setup() {
@@ -133,6 +148,10 @@ void AstrolabeUI::setup() {
      （`api_connection.cpp` の `state_subs_at_ = -1`）。
      ここで全部登録しておけば接続時にまとめて告げられる。 */
   for (auto &s : this->slots_) {
+    /* ⚠️ **`generic` は entity を持たない。** 空の entity を購読しにいかない。 */
+    if (s.entity_id.empty()) {
+      continue;
+    }
     this->subscribe_homeassistant_state(&AstrolabeUI::on_ha_state_, s.entity_id);
     ESP_LOGCONFIG(TAG, "  subscribe %s", s.entity_id.c_str());
     if (s.type == SlotType::LIGHT) {
@@ -327,6 +346,11 @@ bool AstrolabeUI::light_ct_available_(int slot, int *min_k, int *max_k) const {
 }
 
 void AstrolabeUI::loop() {
+  /* ⚠️ **APIの生死を描画タスクへ渡す。** 描画タスクからAPIを触らせない約束なので、
+     ここで写す。`generic` の「送った / 繋がっていない」の判定に使う。 */
+  this->api_connected_.store(api::global_api_server != nullptr &&
+                             api::global_api_server->is_connected());
+
   /* 鳴らし終わりの後始末。⚠️ **キューの処理より先**——
      取り出しで時間を食っても、鳴り終わりが延びないようにする。 */
   if (this->beep_until_ms_ != 0 && millis() >= this->beep_until_ms_) {
@@ -362,6 +386,26 @@ void AstrolabeUI::loop() {
           this->beep_until_ms_ = millis() + action.ms;
         }
         break;
+
+      case ActionKind::CALL_GESTURE: {
+        /* ⚠️ **文字列はキューに載せない**（FreeRTOSのキューは中身をコピーするので
+           `std::string` を載せると壊れる）。載せるのは添字だけで、**実体はここで引く**。 */
+        if (action.gesture >= static_cast<uint8_t>(Gesture::COUNT)) {
+          break;
+        }
+        const auto &target = this->slots_[action.slot].gestures[action.gesture];
+        if (target.service.empty()) {
+          break;
+        }
+        const auto dot = target.service.find('.');
+        if (dot == std::string::npos) {
+          ESP_LOGE(TAG, "gesture service '%s' has no domain", target.service.c_str());
+          break;
+        }
+        ESP_LOGI(TAG, "gesture -> %s %s", target.service.c_str(), target.entity_id.c_str());
+        this->call_homeassistant_service(target.service, {{"entity_id", target.entity_id}});
+        break;
+      }
 
       case ActionKind::SET_LIGHT:
         if (!action.is_on) {
@@ -441,9 +485,25 @@ bool AstrolabeUI::open_app_(int index, uint32_t now) {
                this->light_app_.brightness, static_cast<int>(this->light_app_.is_on));
       return true;
     }
+
+    case SlotType::GENERIC: {
+      /* ⚠️ **状態を持たないアプリ。** 購読も無く、開いた時点で出すものは見出しだけ。 */
+      this->generic_app_ = GenericAppState{};
+      this->app_slot_ = index;
+      this->set_screen_(Screen::APP);
+      this->last_activity_ms_ = now;
+      ESP_LOGI(TAG, "open app: slot %d (generic)", index);
+      return true;
+    }
+
+    case SlotType::CLIMATE:
+    case SlotType::COVER:
+    case SlotType::MEDIA_PLAYER:
+      /* ⚠️ **まだ画面が無い。** 黙って開いて何も出さないより、開かない方がよい。 */
+      break;
   }
   /* ⚠️ 未対応の種別は**黙って落とさない**。開けなかったと言い、ランチャーに留まる。 */
-  ESP_LOGW(TAG, "open_app: slot %d has no app for its type", index);
+  ESP_LOGW(TAG, "open_app: slot %d has no app for its type yet", index);
   return false;
 }
 
@@ -499,6 +559,10 @@ void AstrolabeUI::light_app_input_(Input in, uint32_t now) {
 }
 
 void AstrolabeUI::on_touch_long_(uint32_t now) {
+  if (this->app_slot_ >= 0 && this->slots_[this->app_slot_].type == SlotType::GENERIC) {
+    this->fire_gesture_(Gesture::HOLD, now, /*show_result=*/true);
+    return;
+  }
   if (!this->light_ct_available_(this->app_slot_, nullptr, nullptr)) {
     /* ⚠️ **無音で断る。** 画面にも `DIM｜CLR` を出していないので、
        ここで鳴らすと「何かが起きた」という嘘になる。 */
@@ -549,7 +613,64 @@ void AstrolabeUI::beep_(uint32_t hz, uint32_t ms) {
   a.kind = ActionKind::BEEP;
   a.hz = static_cast<uint16_t>(hz);
   a.ms = static_cast<uint16_t>(ms);
+  /* ⚠️ 鳴らし損ねは数えない——**音が1つ落ちても、起きたことは変わらない**。
+     数えるのは「Home Assistant を呼ぶはずだったのに呼べなかった」ものだけ。 */
   xQueueSend(this->action_queue_, &a, 0);
+}
+
+void AstrolabeUI::fire_gesture_(Gesture g, uint32_t now, bool show_result) {
+  if (this->app_slot_ < 0) {
+    return;
+  }
+  const auto &target = this->slots_[this->app_slot_].gestures[static_cast<uint8_t>(g)];
+  if (target.service.empty()) {
+    /* ⚠️ **書かれていないジェスチャは、何もせず鳴らさない。**
+       鳴らすと「効いたが対象が悪い」と読めてしまう。 */
+    ESP_LOGD(TAG, "gesture %u not configured", static_cast<unsigned>(g));
+    return;
+  }
+
+  Action a{};
+  a.kind = ActionKind::CALL_GESTURE;
+  a.slot = static_cast<uint8_t>(this->app_slot_);
+  a.gesture = static_cast<uint8_t>(g);
+  const bool queued = xQueueSend(this->action_queue_, &a, 0) == pdTRUE;
+  if (!queued) {
+    /* ⚠️ **黙って落とさない。** `light` の1目盛りと違い、ここは**1目盛り＝1回の実行**。 */
+    this->dropped_actions_.fetch_add(1);
+    ESP_LOGW(TAG, "gesture dropped: action queue full");
+  }
+
+  const bool online = this->api_connected_.load();
+  this->beep_(online ? BEEP_HZ_ACTION : BEEP_HZ_OFFLINE, online ? BEEP_MS : BEEP_MS_MODE);
+  this->last_activity_ms_ = now;
+
+  if (show_result) {
+    /* ⚠️ **回転では出さない。** 連続操作なので、結果画面を挟むと回し続けられない。 */
+    this->generic_app_.result = (online && queued) ? GenericResult::SENT : GenericResult::OFFLINE;
+    this->generic_app_.result_at_ms = now;
+  }
+}
+
+void AstrolabeUI::app_input_(Input in, uint32_t now) {
+  if (this->app_slot_ < 0) {
+    return;
+  }
+  /* ⚠️ **種別で分岐するのはここ1箇所。** 呼び先が増えても、分岐は増やさない。 */
+  switch (this->slots_[this->app_slot_].type) {
+    case SlotType::LIGHT:
+      this->light_app_input_(in, now);
+      return;
+    case SlotType::GENERIC:
+      this->fire_gesture_(in == Input::ROTATE_CW ? Gesture::ROTATE_RIGHT : Gesture::ROTATE_LEFT, now,
+                          /*show_result=*/false);
+      return;
+    case SlotType::CLIMATE:
+    case SlotType::COVER:
+    case SlotType::MEDIA_PLAYER:
+      /* まだ実装していない。⚠️ **開けないので、ここへは来ない**（`open_app_` が断る）。 */
+      return;
+  }
 }
 
 void AstrolabeUI::set_screen_(Screen next) {
@@ -681,6 +802,10 @@ void AstrolabeUI::on_touch_short_(uint32_t now) {
       return;
 
     case Screen::APP:
+      if (this->app_slot_ >= 0 && this->slots_[this->app_slot_].type == SlotType::GENERIC) {
+        this->fire_gesture_(Gesture::TAP, now, /*show_result=*/true);
+        return;
+      }
       /* アプリの中でのタップはトグル。 */
       this->last_activity_ms_ = now;
       this->light_app_.is_on = !this->light_app_.is_on;
@@ -768,7 +893,7 @@ void AstrolabeUI::apply_input_(Input in, uint32_t now) {
         this->set_screen_(Screen::LAUNCHER);
         this->app_slot_ = -1;
       } else {
-        this->light_app_input_(in, now);
+        this->app_input_(in, now);
       }
       return;
   }
@@ -834,6 +959,37 @@ void AstrolabeUI::ui_task_() {
         break;
 
       case Screen::APP:
+        /* ⚠️ **`generic` は状態を持たないので、こだまも送信も無い。**
+           結果を少し見せてから待受へ戻すだけ。 */
+        if (this->app_slot_ >= 0 && this->slots_[this->app_slot_].type == SlotType::GENERIC) {
+          if (now - this->last_activity_ms_ >= IDLE_TIMEOUT_MS) {
+            ESP_LOGI(TAG, "app -> clock (idle)");
+            this->set_screen_(Screen::CLOCK);
+            this->app_slot_ = -1;
+            this->last_clock_render_ms_ = now - CLOCK_RENDER_MS;
+            break;
+          }
+          if (this->generic_app_.result != GenericResult::IDLE &&
+              now - this->generic_app_.result_at_ms >= GENERIC_RESULT_MS) {
+            this->generic_app_.result = GenericResult::IDLE;
+          }
+          {
+            const auto &slot = this->slots_[this->app_slot_];
+            const auto &tags = this->render_slots_[this->app_slot_];
+            GenericView view{};
+            view.tag_up = &tags.tag_up;
+            view.tag_down = &tags.tag_down;
+            view.result = static_cast<uint8_t>(this->generic_app_.result);
+            view.has_tap = !slot.gestures[static_cast<int>(Gesture::TAP)].service.empty();
+            view.has_hold = !slot.gestures[static_cast<int>(Gesture::HOLD)].service.empty();
+            view.has_rotate = !slot.gestures[static_cast<int>(Gesture::ROTATE_RIGHT)].service.empty() ||
+                              !slot.gestures[static_cast<int>(Gesture::ROTATE_LEFT)].service.empty();
+            render_generic(this->canvas_, view);
+          }
+          this->canvas_->pushSprite(0, 0);
+          break;
+        }
+
         /* アプリも無操作で時計へ。⚠️ ランチャーではなく**時計へ**戻る。 */
         if (now - this->last_activity_ms_ >= IDLE_TIMEOUT_MS) {
           this->light_app_publish_(now, /*force=*/this->light_app_.publish_pending);

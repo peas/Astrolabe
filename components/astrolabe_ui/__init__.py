@@ -42,20 +42,104 @@ CONF_SLOTS = "slots"
 CONF_TAG_UP = "tag_up"
 CONF_TAG_DOWN = "tag_down"
 
-#: いま扱う種別 → 期待する entity のドメイン。
+#: エンティティを1つ持つ種別 → 期待する entity のドメイン。
 #: ⚠️ **増やすときは C++ 側の `SlotType` と、下の `SLOT_TYPE_IDS` を一緒に増やす。**
-#: ⚠️ 0.2.0 で足す種別は `climate` / `cover` / `media_player` / `generic`（決定D4）。
-#:    **種別名は entity のドメインと一致させる**——一致していれば下の検証が表を持たずに済む。
+#: ⚠️ **種別名は entity のドメインと一致させる**——一致していれば検証が表を持たずに済む。
 SLOT_TYPE_LIGHT = "light"
-SLOT_TYPES = {SLOT_TYPE_LIGHT: "light"}
+SLOT_TYPE_CLIMATE = "climate"
+SLOT_TYPE_COVER = "cover"
+SLOT_TYPE_MEDIA = "media_player"
+#: ⚠️ **`generic` だけ entity を持たない。** ジェスチャごとに呼び先を書く。
+SLOT_TYPE_GENERIC = "generic"
+
+SLOT_TYPES = {
+    SLOT_TYPE_LIGHT: "light",
+    SLOT_TYPE_CLIMATE: "climate",
+    SLOT_TYPE_COVER: "cover",
+    SLOT_TYPE_MEDIA: "media_player",
+}
 
 #: C++ 側 `SlotType` の値。⚠️ **順番ではなく名前で対応させる**——
 #: YAMLの見た目やdictの並びに依存させない。
-SLOT_TYPE_IDS = {SLOT_TYPE_LIGHT: 0}
+SLOT_TYPE_IDS = {
+    SLOT_TYPE_LIGHT: 0,
+    SLOT_TYPE_CLIMATE: 1,
+    SLOT_TYPE_COVER: 2,
+    SLOT_TYPE_MEDIA: 3,
+    SLOT_TYPE_GENERIC: 4,
+}
 
-#: `icon:` を書かなかったときの既定。⚠️ **種別ごとに持つ**——
-#: 種別ごとに既定を持つ。
-DEFAULT_ICONS = {SLOT_TYPE_LIGHT: "mdi:lightbulb"}
+#: `icon:` を書かなかったときの既定。⚠️ **種別ごとに持つ。**
+DEFAULT_ICONS = {
+    SLOT_TYPE_LIGHT: "mdi:lightbulb",
+    SLOT_TYPE_CLIMATE: "mdi:air-conditioner",
+    SLOT_TYPE_COVER: "mdi:window-shutter",
+    SLOT_TYPE_MEDIA: "mdi:music",
+    SLOT_TYPE_GENERIC: "mdi:gesture-tap-button",
+}
+
+# ── generic のジェスチャ ────────────────────────────────────────────────
+CONF_TAP = "tap"
+CONF_HOLD = "hold"
+CONF_ROTATE_RIGHT = "rotate_right"
+CONF_ROTATE_LEFT = "rotate_left"
+
+#: C++ 側 `Gesture` の値。名前で対応させる。
+GESTURES = {CONF_TAP: 0, CONF_HOLD: 1, CONF_ROTATE_RIGHT: 2, CONF_ROTATE_LEFT: 3}
+
+#: ⚠️ **「押す」の意味がドメインごとに違う。** toggle で済ませると意図と別のことが起きる。
+#:    Home Assistant のサービス一覧を実際に問い合わせて確かめた（2026-08-11）:
+#:      - `script.toggle`     … 走っていれば**止める**。起動したいなら turn_on
+#:      - `automation.toggle` … 自動化の**有効/無効**の切替。実行ではない
+#:      - `button` / `scene`  … そもそも toggle が無い
+GESTURE_SERVICES = {
+    "button": "button.press",
+    "input_button": "input_button.press",
+    "scene": "scene.turn_on",
+    "script": "script.turn_on",
+    "automation": "automation.trigger",
+}
+
+#: 上の表に無いドメインのうち、**自前の `toggle` を持つもの**。
+#: ⚠️ **`homeassistant.toggle` を使わない。** `cover` と `valve` は `turn_on`/`turn_off` を
+#:    持たないので `homeassistant.toggle` では動かない（実物で確認）。`<domain>.toggle` なら動く。
+#: ⚠️ ここに無いドメインは**ビルドで落とす**。実行時に黙って失敗させない——
+#:    利用者には「設定の誤り」と「通信障害」の区別がつかないため。
+GESTURE_TOGGLEABLE = (
+    "light",
+    "switch",
+    "fan",
+    "cover",
+    "valve",
+    "input_boolean",
+    "media_player",
+    "climate",
+    "humidifier",
+    "siren",
+    "remote",
+)
+
+
+def gesture_service(entity_id: str) -> str:
+    """ジェスチャに書かれた entity を、呼ぶべきサービスへ。
+
+    ⚠️ **Python側で解決する。** C++へは「サービス名」と「entity」だけを渡す——
+    表がここにあれば、**書けない組み合わせはビルドで落ちる**。
+    """
+    domain = entity_id.split(".", 1)[0]
+    if domain in GESTURE_SERVICES:
+        return GESTURE_SERVICES[domain]
+    if domain in GESTURE_TOGGLEABLE:
+        return f"{domain}.toggle"
+    raise cv.Invalid(
+        f"{entity_id} は astrolabe_ui のジェスチャから操作できません。"
+        f"押したときに何をすべきかが決まらないドメインです（{domain}.）。\n"
+        "操作できるのは: "
+        + ", ".join(sorted(list(GESTURE_SERVICES) + list(GESTURE_TOGGLEABLE)))
+        + "\n⚠️ 値を選ぶ種類のもの（input_number. や select. など）は、"
+        "スクリプトに包んで script. を指してください"
+    )
+
 
 CONF_BUZZER = "buzzer"
 CONF_SOUND = "sound"
@@ -63,47 +147,121 @@ CONF_ICON_BG = "icon_bg"
 CONF_ICON_FG = "icon_fg"
 
 
-def _validate_entity_domain(config):
+# ⚠️ **`cv.typed_schema` は `type` を pop してから内側を検証する**
+#    （`config_validation.py:2037,2044-2045`）。つまり**内側のバリデータからは
+#    `type` が見えない**。種別を引数で渡す形にしてある——見えないものを読むと
+#    `KeyError: 'type'` で落ちる（実際に踏んだ）。
+
+
+def _entity_domain_validator(type_name):
     """`type` と `entity` のドメインが噛み合っているか。
 
-    ⚠️ ここで弾かないと、**実機が存在しない対象を操作し続ける**ことになる
+    ⚠️ ここで弾かないと、**実在しない対象を操作し続ける**ことになる
     （画面には出るが何も起きない、という一番分かりにくい壊れ方）。
     """
-    domain = config[CONF_ENTITY_ID].split(".", 1)[0]
-    want = SLOT_TYPES[config[CONF_TYPE]]
-    if domain != want:
+
+    want = SLOT_TYPES[type_name]
+
+    def validate(config):
+        domain = config[CONF_ENTITY_ID].split(".", 1)[0]
+        if domain != want:
+            raise cv.Invalid(
+                f"type: {type_name} には {want}. で始まる entity が要ります"
+                f"（指定されたのは {config[CONF_ENTITY_ID]}）"
+            )
+        return config
+
+    return validate
+
+
+def _default_icon_validator(type_name):
+    """`icon:` 未指定なら種別の既定を入れる。⚠️ **既定を1箇所に閉じる。**"""
+
+    def validate(config):
+        if CONF_ICON not in config:
+            config[CONF_ICON] = DEFAULT_ICONS[type_name]
+        return config
+
+    return validate
+
+
+#: すべての種別に共通の欄。
+_COMMON = {
+    cv.Required(CONF_TAG_UP): cv.string,
+    cv.Optional(CONF_TAG_DOWN, default=""): cv.string,
+    # ⚠️ ここでは**書式しか見ない**。実在するかはビルド時（`to_code`）。
+    #    実在確認をここへ持ってくると `esphome config` がネットワーク必須になる。
+    cv.Optional(CONF_ICON): icons.validate_icon,
+    cv.Optional(CONF_ICON_BG, default=icons.DEFAULT_ICON_BG): cv.string,
+    cv.Optional(CONF_ICON_FG, default=icons.DEFAULT_ICON_FG): cv.string,
+    # 焼き込む画素配列のID。利用者は書かない（ESPHomeの `image:` と同じ作り）。
+    cv.GenerateID(CONF_RAW_DATA_ID): cv.declare_id(cg.uint16),
+}
+
+
+def _entity_slot(type_name, schema_extra=None):
+    """entity を1つ持つ種別のスキーマ。"""
+    d = dict(_COMMON)
+    d[cv.Required(CONF_ENTITY_ID)] = cv.entity_id
+    if schema_extra:
+        d.update(schema_extra)
+    return cv.All(
+        cv.Schema(d),
+        _entity_domain_validator(type_name),
+        _default_icon_validator(type_name),
+    )
+
+
+def _validate_generic(config):
+    """⚠️ **1つもジェスチャが書かれていない `generic` を通さない。**
+
+    通すと、リングに並んで開けるのに**押しても何も起きないスロット**ができる。
+    どこが悪いのか利用者には分からない（画面は正常に見える）。
+    """
+    if not any(g in config for g in GESTURES):
         raise cv.Invalid(
-            f"type: {config[CONF_TYPE]} には {want}. で始まる entity が要ります"
-            f"（指定されたのは {config[CONF_ENTITY_ID]}）"
+            "type: generic には "
+            + " / ".join(GESTURES)
+            + " のうち少なくとも1つが要ります（どれも無いと、開けても何も起きません）"
         )
     return config
 
 
-def _apply_default_icon(config):
-    """`icon:` 未指定なら種別の既定を入れる。⚠️ **既定を1箇所に閉じる。**"""
-    if CONF_ICON not in config:
-        config[CONF_ICON] = DEFAULT_ICONS[config[CONF_TYPE]]
+def _validate_gesture_entities(config):
+    """⚠️ **押せないドメインをビルドで落とす。** 実行時に黙って失敗させない。"""
+    for g in GESTURES:
+        if g in config:
+            gesture_service(config[g])  # 決まらなければ cv.Invalid を投げる
     return config
 
 
-SLOT_SCHEMA = cv.All(
+GENERIC_SCHEMA = cv.All(
     cv.Schema(
         {
-            cv.Required(CONF_TYPE): cv.one_of(*SLOT_TYPES, lower=True),
-            cv.Required(CONF_ENTITY_ID): cv.entity_id,
-            cv.Required(CONF_TAG_UP): cv.string,
-            cv.Optional(CONF_TAG_DOWN, default=""): cv.string,
-            # ⚠️ ここでは**書式しか見ない**。実在するかはビルド時（`to_code`）。
-            #    実在確認をここへ持ってくると `esphome config` がネットワーク必須になる。
-            cv.Optional(CONF_ICON): icons.validate_icon,
-            cv.Optional(CONF_ICON_BG, default=icons.DEFAULT_ICON_BG): cv.string,
-            cv.Optional(CONF_ICON_FG, default=icons.DEFAULT_ICON_FG): cv.string,
-            # 焼き込む画素配列のID。利用者は書かない（ESPHomeの `image:` と同じ作り）。
-            cv.GenerateID(CONF_RAW_DATA_ID): cv.declare_id(cg.uint16),
+            **_COMMON,
+            # ⚠️ **4つとも任意。** 書かれていないジェスチャは何も起こさず、鳴らない。
+            cv.Optional(CONF_TAP): cv.entity_id,
+            cv.Optional(CONF_HOLD): cv.entity_id,
+            cv.Optional(CONF_ROTATE_RIGHT): cv.entity_id,
+            cv.Optional(CONF_ROTATE_LEFT): cv.entity_id,
         }
     ),
-    _validate_entity_domain,
-    _apply_default_icon,
+    _validate_generic,
+    _validate_gesture_entities,
+    _default_icon_validator(SLOT_TYPE_GENERIC),
+)
+
+#: ⚠️ **種別ごとにスキーマが分かれる。** `generic` は `entity_id` を持たず、
+#:    代わりにジェスチャごとの呼び先を持つ——**同じスキーマには収まらない**。
+SLOT_SCHEMA = cv.typed_schema(
+    {
+        SLOT_TYPE_LIGHT: _entity_slot(SLOT_TYPE_LIGHT),
+        SLOT_TYPE_CLIMATE: _entity_slot(SLOT_TYPE_CLIMATE),
+        SLOT_TYPE_COVER: _entity_slot(SLOT_TYPE_COVER),
+        SLOT_TYPE_MEDIA: _entity_slot(SLOT_TYPE_MEDIA),
+        SLOT_TYPE_GENERIC: GENERIC_SCHEMA,
+    },
+    lower=True,
 )
 
 
@@ -213,7 +371,7 @@ async def to_code(config):
         cg.add(var.set_buzzer(await cg.get_variable(config[CONF_BUZZER])))
 
     positions = ring.slot_positions(len(config[CONF_SLOTS]))
-    for slot, (x, y) in zip(config[CONF_SLOTS], positions):
+    for index, (slot, (x, y)) in enumerate(zip(config[CONF_SLOTS], positions)):
         # ⚠️ **ここで初めてネットワークを使う**（MDIの固定タグから取得・キャッシュあり）。
         #    アイコン名が実在しなければ、ここで名指しで落ちる。
         pixels = icons.render_icon(
@@ -223,7 +381,9 @@ async def to_code(config):
         cg.add(
             var.add_slot(
                 SLOT_TYPE_IDS[slot[CONF_TYPE]],
-                slot[CONF_ENTITY_ID],
+                # ⚠️ `generic` は entity を持たない。空文字で渡す——
+                #    C++側は「空なら状態を購読しない」で扱う。
+                slot.get(CONF_ENTITY_ID, ""),
                 slot[CONF_TAG_UP],
                 slot[CONF_TAG_DOWN],
                 x,
@@ -231,3 +391,12 @@ async def to_code(config):
                 arr,
             )
         )
+        # ⚠️ **サービス名はここで解決して渡す。** C++側に表を持たせない——
+        #    表がPython側にあれば、**押せない組み合わせはビルドで落ちる**。
+        for gesture, gesture_id in GESTURES.items():
+            if gesture in slot:
+                cg.add(
+                    var.add_gesture(
+                        index, gesture_id, gesture_service(slot[gesture]), slot[gesture]
+                    )
+                )
