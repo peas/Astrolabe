@@ -77,6 +77,12 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
   /** 読み返した累計。⚠️ **これが止まったら描画タスクが止まっている**——
    * `loop_time` はメインループの生死しか示さないので、こちらが要る。 */
   int touch_g_ctrl_polls() const { return this->g_ctrl_polls_.load(); }
+  /** タッチの読み取りに失敗した累計。
+   * ⚠️ **これは0にならない。** 実機で十数秒に1回の割合で観測される。
+   * 押している最中に起きると、素朴な作りでは「指が離れた」に化ける——
+   * 状態機械はそのフレームを捨てているので、**この数が伸びること自体は異常ではない**。
+   * 急に増えたら、バスか配線の方を疑う手がかりになる。 */
+  int touch_read_fails() const { return this->tp_read_fail_.load(); }
 
  protected:
   /** リングに置ける上限。⚠️ **Python側 `ring.py` の `SLOTS_MAX` と一致させること。** */
@@ -98,6 +104,10 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
 
   /** 明るさの1目盛り。 */
   static constexpr int BRIGHTNESS_STEP = 8;
+  /** 色温度の1目盛り（K）。⚠️ **範囲と違ってこれは固定**——
+   * 範囲は個体ごとに違うので Home Assistant に従うが、刻みの粗さは好みの問題で、
+   * 「同じ製品の別の個体で当然に違うもの」ではない。 */
+  static constexpr int COLOR_TEMP_STEP = 200;
   /** 回している間の送信間引き。
    * ⚠️ これが無いとノブ1目盛りごとにHAを叩く。 */
   static constexpr uint32_t PUBLISH_INTERVAL_MS = 120;
@@ -118,10 +128,29 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
   static constexpr uint32_t BEEP_HZ_PRESS = 2000;
   /** 起床とトグル——**画面の中で何かが起きた**ことを示す。 */
   static constexpr uint32_t BEEP_HZ_ACTION = 4000;
+  /** 長押しでのモード切替。⚠️ **他のどれとも違う音にする**——
+   * 同じ場所を押していても起きることが違うので、目を離していたら音でしか分からない。 */
+  static constexpr uint32_t BEEP_HZ_MODE = 3000;
+  /** モード切替だけ長く鳴らす。**画面の意味が変わる**ので、他より重い手応えにする。 */
+  static constexpr uint32_t BEEP_MS_MODE = 40;
 
   /** ランチャーで「開く」と見なす中央円の半径。
    * ⚠️ これが無いと**リング上のアイコンを触っただけで開く**。 */
   static constexpr int CENTER_TAP_RADIUS = 50;
+  /** アプリの中でタッチを受ける中央円の半径。
+   * ⚠️ **全画面で受けない。** 長押しでモードが変わるので、全画面のままだと
+   * **ダイヤルの縁を握っただけで切り替わる**。 */
+  static constexpr int APP_TAP_RADIUS = 70;
+
+  /** これ未満の接触はゴーストとして捨てる。 */
+  static constexpr uint32_t TOUCH_GHOST_MS = 70;
+  /** これ以上で長押し。⚠️ **閾値を跨いだ瞬間に撃つ**——離してから判定しない。
+   * 離してから決めると「ライトは打ち切って反応するのにボタンはしない」になる。 */
+  static constexpr uint32_t TOUCH_LONGPRESS_MS = 500;
+  /** 接触がこれ以上続いたら見限る。
+   * ⚠️ **タッチ点数レジスタが非0に張り付く故障がある**（`hal_tp.hpp` 参照）。
+   * そのとき指が触れていないのに「押しっぱなし」に見えるので、受け皿が要る。 */
+  static constexpr uint32_t TOUCH_MAX_PRESS_MS = 10000;
 
   /** いま出ている画面。⚠️ **描画タスクだけが持ち、描画タスクだけが変える。** */
   enum class Screen : uint8_t { LAUNCHER, CLOCK, APP };
@@ -145,11 +174,19 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
     ActionKind kind;
     /** `BEEP` のときの音程。他の種類では見ない。 */
     uint16_t hz;
+    /** `BEEP` のときの長さ。他の種類では見ない。 */
+    uint16_t ms;
     uint8_t slot;
     /** `SET_LIGHT` のときの 0-255。`TOGGLE_SLOT` では見ない。 */
     int16_t brightness;
+    /** `SET_LIGHT` のときに添える色温度（K）。⚠️ **`-1` ＝ 添えない。**
+     * 既定値ではなく逃げ道——**利用者が選んでいない色温度を送り返さない**ため。 */
+    int16_t color_temp;
     bool is_on;
   };
+
+  /** 調光画面のモード。⚠️ **長押しで行き来する。** */
+  enum class LightMode : uint8_t { DIMMER, COLOR_TEMP };
 
   struct SlotConfig {
     SlotType type;
@@ -163,6 +200,12 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
    * 混ぜると、回している最中にこだまが割り込んで**ノブと綱引きになる**。 */
   struct LightAppState {
     int brightness;
+    LightMode mode;
+    /** 編集中の色温度（K）。⚠️ **`-1` ＝ 確からしい値を知らない。**
+     * `brightness` の `-1` と同じ作法だが、こちらにはもう一段強い意味がある——
+     * **知らない値を Home Assistant へ送り返さない**ため。範囲外の値を丸めて
+     * 「知っている」ことにすると、点けた瞬間に**利用者が選んでいない色**になる。 */
+    int color_temp;
     bool is_on;
     bool state_received;
     uint32_t last_local_change_ms;
@@ -170,10 +213,46 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
     bool publish_pending;
   };
 
+  /** 進行中の接触。⚠️ **描画タスクの持ち物。**
+   *
+   * ⚠️ 0.1.0 は「触れている」ことだけを見て、押した瞬間に動作を撃っていた。
+   * 押下と離上を**別々の出来事**として扱いはじめた時点で、その間に起きることが
+   * 全部意味を持つようになる——**画面が変わる／選択が動く／通信がこける**。 */
+  struct TouchGesture {
+    bool down;
+    /** 押し**始めた**位置が中央円の中だったか。⚠️ 離した位置では判定しない。 */
+    bool in_center;
+    /** 動作を撃った、または取り消した。⚠️ **`stuck_reported` と分ける**——
+     * 1つにまとめると、長押しを撃った指を置いたままにしたとき、
+     * 見限りの警告が出ないか、毎周期出続けるかのどちらかにしかならない。 */
+    bool action_fired;
+    bool stuck_reported;
+    uint32_t press_ms;
+    /** 押し**始めた**画面。⚠️ 離すまでに変わっていたら、その接触は無かったことにする。 */
+    Screen screen;
+    /** 押し**始めた**ときの対象スロット。
+     * ⚠️ ランチャーで押しながらノブを回しても、開くのは**押した方**。 */
+    int slot;
+  };
+
   static void ui_task_trampoline(void *arg);
   void ui_task_();
   /** 生の入力を、**いまの画面の意味**へ翻訳して適用する。⚠️ 描画タスクからのみ呼ぶ。 */
   void apply_input_(Input in, uint32_t now);
+  /** 画面を変える**唯一の口**。⚠️ `screen_` へ直接代入しないこと——
+   * ここで進行中の接触を取り消している。**規則を守るのではなく、破る道を塞ぐ**形にしてある
+   * （0.1.0 で入力の解釈を1箇所へ寄せたのと同じ手）。 */
+  void set_screen_(Screen next);
+  /** 進行中の接触を「この接触ではもう何もしない」印付きにする。
+   * ⚠️ 指はまだ触れているので `down` は倒さない——倒すと、そのまま押し続けている指が
+   * **新しい押下として数え直される**。 */
+  void cancel_touch_(const char *why);
+  /** タッチの状態機械。⚠️ 描画タスクから毎周期1回だけ。 */
+  void poll_touch_(uint32_t now);
+  /** 接触が短押しとして確定したとき（**離した瞬間**）。 */
+  void on_touch_short_(uint32_t now);
+  /** 接触が長押しの閾値を跨いだとき（**まだ指は触れている**）。 */
+  void on_touch_long_(uint32_t now);
   /** スロット `index` のアプリを開く。⚠️ **種別で分岐する**——
    * ここに `LIGHT` を直書きしないこと。直書きすると
    * 「0番に別種別を入れても時計からはライトが開く」を踏む。
@@ -181,7 +260,7 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
   bool open_app_(int index, uint32_t now);
   /** 手応えを鳴らす意図を積む。⚠️ **描画タスクから直接 output を触らない**——
    * ESPHomeのコンポーネントはメインループの持ち物。積むだけにする。 */
-  void beep_(uint32_t hz);
+  void beep_(uint32_t hz, uint32_t ms = BEEP_MS);
   /** 調光画面での入力。⚠️ 描画タスクからのみ。 */
   void light_app_input_(Input in, uint32_t now);
   /** 間引きつきの送信。⚠️ 積むだけで、呼ぶのはメインループ。 */
@@ -191,6 +270,17 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
    * ⚠️ 消灯するとHAは `brightness` 属性ごと落とし、**そのとき何も送ってこない**
    * （`manager.py:435` が早期return）。よってここは「最後に届いた明るさ」を保つ。 */
   void on_ha_brightness_(std::string entity_id, std::string value);
+  void on_ha_color_temp_(std::string entity_id, std::string value);
+  void on_ha_ct_min_(std::string entity_id, std::string value);
+  void on_ha_ct_max_(std::string entity_id, std::string value);
+  /** ⚠️ 値は Python の repr の文字列（`"['color_temp']"`）。JSONではない。 */
+  void on_ha_color_modes_(std::string entity_id, std::string value);
+  /** entity_id からスロット番号。見つからなければ `-1`。 */
+  int slot_index_(const std::string &entity_id) const;
+  /** スロット `slot` で**いま**色温度をいじれるか。いじれるなら範囲も返す。
+   * ⚠️ **毎回 atomic から読む**（アプリを開いたときの写しを使わない）——
+   * 開いている最中に電球が替わっても追随できるようにするため。 */
+  bool light_ct_available_(int slot, int *min_k, int *max_k) const;
 
   LGFX_StampRing display_;
   /** ⚠️ **`display_` は描画タスクの持ち物**。`dump_config()`（メインループ）から
@@ -211,6 +301,16 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
   /** HAから届いた明るさ 0-255。`-1` ＝ **まだ一度も届いていない**。
    * ⚠️ **0 と区別する**——0は「点いているが最小」、-1は「知らない」。 */
   std::atomic<int16_t> brightness_[SLOTS_MAX];
+  /** HAから届いた色温度（K）。`-1` ＝ **まだ確からしい値を知らない**。
+   * ⚠️ **範囲での検査は使う側で行う**——属性は別々に届くので、
+   * 値が先に来て範囲が後から来ることがある。 */
+  std::atomic<int16_t> color_temp_[SLOTS_MAX];
+  std::atomic<int16_t> ct_min_[SLOTS_MAX];
+  std::atomic<int16_t> ct_max_[SLOTS_MAX];
+  /** ⚠️ **いま色温度に対応しているか。** `supported_color_modes` が届くたび作り直す——
+   * 一度立てたら降ろさない旗にすると、**電球を替えたときに嘘をつく**
+   * （ビルド時に焼き込む案を却下したのと同じ理由が、実行時にもそのまま当てはまる）。 */
+  std::atomic<bool> ct_capable_[SLOTS_MAX];
 
   /* タッチ計器の写し。**描画タスクが書き、メインループが読む。**
    * ⚠️ 生の値はタッチドライバの中にあるが、そこは描画タスクの持ち物なので直接読ませない。 */
@@ -218,6 +318,7 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
   std::atomic<int16_t> g_ctrl_boot_{-1};
   std::atomic<uint16_t> g_ctrl_bad_{0};
   std::atomic<uint32_t> g_ctrl_polls_{0};
+  std::atomic<uint16_t> tp_read_fail_{0};
 
   /** 描画タスク → メインループ（Home Assistant を呼ぶ意図）。 */
   QueueHandle_t action_queue_{nullptr};
@@ -227,10 +328,10 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
   ledc::LEDCOutput *buzzer_{nullptr};
   /** 鳴らし終わる時刻。`0` ＝ 鳴っていない。⚠️ **メインループの持ち物。** */
   uint32_t beep_until_ms_{0};
-  uint32_t last_touch_ms_{0};
 
   /* ⚠️ ここから下は**描画タスクの持ち物**。他のタスクから読まないこと（atomicにしていない）。 */
   Screen screen_{Screen::LAUNCHER};
+  TouchGesture touch_{};
   /** 最後に「利用者が何かした」時刻。⚠️ **時計にいる間は更新しない**——
    * 時計が毎フレーム「今操作された」と記録すると、タイムアウトを自分で無効化してしまう。
    * **時計はアイドル画面そのもの**なので、

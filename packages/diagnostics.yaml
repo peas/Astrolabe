@@ -73,6 +73,20 @@ sensor:
     accuracy_decimals: 0
 
   - platform: template
+    name: Touch Read Failures
+    id: astrolabe_touch_read_fails
+    entity_category: diagnostic
+    # Failed I2C reads of the touch controller. This does not stay at zero: on the
+    # reference hardware it ticks up every ten seconds or so. A failed read returns
+    # "no touch", which is indistinguishable from a finger being lifted, so the
+    # component discards those frames rather than treating them as a release.
+    # Watch for the rate changing, not for the value being non-zero.
+    lambda: 'return id(astrolabe_ui_id)->touch_read_fails();'
+    update_interval: 60s
+    accuracy_decimals: 0
+    state_class: total_increasing
+
+  - platform: template
     name: Touch Poll Count
     id: astrolabe_touch_polls
     entity_category: diagnostic

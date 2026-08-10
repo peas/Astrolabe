@@ -143,10 +143,18 @@ namespace FT3267
                心拍は健康なまま古いキャッシュを送り続ける**。この数が伸びていなければ
                「0だった」ではなく「読んでいない」。 */
             volatile uint32_t _g_ctrl_polls = 0;
-            /* 直近のタッチポイント数レジスタ（生値）。非0に張り付くと `_drain_touch()` の
-               `while (isTouched())` が抜けられず、G_CTRLは0のままタッチだけ死ぬ——
+            /* 直近のタッチポイント数レジスタ（生値）。**非0に張り付く故障がある**——
+               そのとき「ずっと指が触れている」ように見え、G_CTRLは0のままタッチだけ死ぬ。
                その故障機序をG_CTRL仮説と切り分けるために持つ。 */
             volatile uint8_t _tp_points_last = 0;
+            /* ⚠️ **直近の読み取りが成功したか。** `getTouchPointsNum()` は読めなかったときも
+               `0` を返すので、**戻り値だけでは「指が無い」と区別できない**（失敗はログには
+               出るが、呼び元には伝わらない）。押下と離上を追う側は、必ずこちらを先に見る——
+               離上を意味のある事象として扱う瞬間から、この曖昧さは
+               「通信が1回こけただけで指を離したことにする」バグになる。 */
+            volatile bool _tp_read_ok = true;
+            /* 読めなかった累計。**0より大きくなったら、上の区別が実際に要ったということ。** */
+            volatile uint16_t _tp_read_fail = 0;
             bool     _g_ctrl_boot_seen = false;
             uint32_t _g_ctrl_next_poll_ms = 0;
 
@@ -339,8 +347,13 @@ namespace FT3267
                 _data_buffer[0] = 0;
                 if (!_read_reg(FT5x06_TOUCH_POINTS, 1))
                 {
+                    /* ⚠️ **0を返すが、これは「指が無い」ではない。**
+                       呼び元は `getTouchReadOk()` で分けること。 */
+                    _tp_read_ok = false;
+                    if (_tp_read_fail < 0xFFFF) _tp_read_fail = _tp_read_fail + 1;
                     return 0;
                 }
+                _tp_read_ok = true;
                 _tp_points_last = _data_buffer[0];
                 return _data_buffer[0];
             }
@@ -388,6 +401,11 @@ namespace FT3267
             inline uint16_t getGCtrlBadCount() const { return _g_ctrl_bad; }
             inline uint32_t getGCtrlPollCount() const { return _g_ctrl_polls; }
             inline uint8_t  getTouchPointsRaw() const { return _tp_points_last; }
+            /** ⚠️ **直前の `getTouchPointsNum()` が読めたか。** `false` のとき戻り値の `0` に
+             *  意味は無い。押下・離上を追う側は、そのフレームを丸ごと捨てること。 */
+            inline bool     getTouchReadOk() const { return _tp_read_ok; }
+            /** 読めなかった累計。 */
+            inline uint16_t getTouchReadFailCount() const { return _tp_read_fail; }
 
 
             /**

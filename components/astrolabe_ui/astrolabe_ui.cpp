@@ -18,9 +18,9 @@ static const char *const TAG = "astrolabe_ui";
    ここで明示しないと電源保持が効かない。 */
 static constexpr gpio_num_t PIN_PWR_HOLDING = GPIO_NUM_46;
 
-/** タッチの連打よけ。⚠️ FT3267 は押している間ずっと点を返すので、
-    これが無いと1タップで何十回もトグルする。 */
-static constexpr uint32_t TOUCH_DEBOUNCE_MS = 400;
+/* ⚠️ かつてここに 400ms の連打よけがあった。FT3267 は押している間ずっと点を返すので、
+   「触れている」だけを見る作りではそれが要る。押下と離上を追うようになったので、
+   **同じ役目はエッジ検出が果たす**——数え直す必要がなくなった。 */
 
 void AstrolabeUI::add_slot(uint8_t type, const std::string &entity_id, const std::string &tag_up,
                            const std::string &tag_down, int x, int y, const uint16_t *icon) {
@@ -45,6 +45,20 @@ void AstrolabeUI::setup() {
   }
   for (auto &b : this->brightness_) {
     b.store(-1);  /* ⚠️ 0ではない。「まだ知らない」を0%と混ぜない。 */
+  }
+  for (auto &c : this->color_temp_) {
+    c.store(-1);
+  }
+  for (auto &c : this->ct_min_) {
+    c.store(-1);
+  }
+  for (auto &c : this->ct_max_) {
+    c.store(-1);
+  }
+  for (auto &c : this->ct_capable_) {
+    /* ⚠️ **既定は「対応していない」。** 届く前と非対応を同じ扱いにする——
+       これが「HAに繋がってから初めて `DIM｜CLR` が出る」の実体。 */
+    c.store(false);
   }
 
   ESP_LOGI(TAG, "display init");
@@ -113,7 +127,15 @@ void AstrolabeUI::setup() {
          `entity_id` だけで、**どの属性の値なのかは来ない**——
          1つの関数に集約すると state と brightness を区別できない。 */
       this->subscribe_homeassistant_state(&AstrolabeUI::on_ha_brightness_, s.entity_id, "brightness");
-      ESP_LOGCONFIG(TAG, "  subscribe %s.brightness", s.entity_id.c_str());
+      /* ⚠️ **`supported_color_modes` が能力の現在値。** ライトなら必ず持っている属性なので、
+         状態が変わるたび届く——電球を替えれば、その場で降りる。
+         min/max は**範囲の供給だけ**に使う（対応していなければそもそも届かない）。 */
+      this->subscribe_homeassistant_state(&AstrolabeUI::on_ha_color_modes_, s.entity_id,
+                                          "supported_color_modes");
+      this->subscribe_homeassistant_state(&AstrolabeUI::on_ha_color_temp_, s.entity_id, "color_temp_kelvin");
+      this->subscribe_homeassistant_state(&AstrolabeUI::on_ha_ct_min_, s.entity_id, "min_color_temp_kelvin");
+      this->subscribe_homeassistant_state(&AstrolabeUI::on_ha_ct_max_, s.entity_id, "max_color_temp_kelvin");
+      ESP_LOGCONFIG(TAG, "  subscribe %s: brightness, color temp (4)", s.entity_id.c_str());
     }
   }
 
@@ -170,6 +192,108 @@ void AstrolabeUI::on_ha_brightness_(std::string entity_id, std::string value) {
   }
 }
 
+int AstrolabeUI::slot_index_(const std::string &entity_id) const {
+  for (size_t i = 0; i < this->slots_.size(); i++) {
+    if (this->slots_[i].entity_id == entity_id) {
+      return static_cast<int>(i);
+    }
+  }
+  return -1;
+}
+
+/** 属性の素の値をケルビンとして読む。
+ *
+ * ⚠️ **`long` で受けてから範囲へ落とす。** 先に `int16_t` へ落とすと、
+ * 65280 のような値が溢れて**別の数に化ける**。
+ * ⚠️ **おかしな値は丸めずに「知らない」を返す。** 実際に `color_temp_kelvin: 65280` を
+ * 報告するライトがある。範囲の端へ丸めると、それを利用者が選んだ値として
+ * 送り返すことになり、**点けた瞬間に選んでいない色になる**。
+ *
+ * @return 読めなければ `-1`
+ */
+static int16_t parse_kelvin_(const std::string &value) {
+  char *end = nullptr;
+  const long v = strtol(value.c_str(), &end, 10);
+  /* 照明の色温度としてありうる幅。ここを通っても、
+     そのライトの min/max に収まっているかは**使う側で**もう一度見る。 */
+  if (end == value.c_str() || v < 1000 || v > 20000) {
+    return -1;
+  }
+  return static_cast<int16_t>(v);
+}
+
+void AstrolabeUI::on_ha_color_temp_(std::string entity_id, std::string value) {
+  const int i = this->slot_index_(entity_id);
+  if (i < 0) {
+    return;
+  }
+  const int16_t k = parse_kelvin_(value);
+  this->color_temp_[i].store(k);
+  if (k < 0) {
+    ESP_LOGW(TAG, "%s.color_temp_kelvin: '%s' is not a usable value; treating as unknown",
+             entity_id.c_str(), value.c_str());
+    return;
+  }
+  ESP_LOGD(TAG, "%s.color_temp_kelvin -> %d", entity_id.c_str(), k);
+}
+
+void AstrolabeUI::on_ha_ct_min_(std::string entity_id, std::string value) {
+  const int i = this->slot_index_(entity_id);
+  if (i < 0) {
+    return;
+  }
+  this->ct_min_[i].store(parse_kelvin_(value));
+  ESP_LOGD(TAG, "%s.min_color_temp_kelvin -> %s", entity_id.c_str(), value.c_str());
+}
+
+void AstrolabeUI::on_ha_ct_max_(std::string entity_id, std::string value) {
+  const int i = this->slot_index_(entity_id);
+  if (i < 0) {
+    return;
+  }
+  this->ct_max_[i].store(parse_kelvin_(value));
+  ESP_LOGD(TAG, "%s.max_color_temp_kelvin -> %s", entity_id.c_str(), value.c_str());
+}
+
+void AstrolabeUI::on_ha_color_modes_(std::string entity_id, std::string value) {
+  const int i = this->slot_index_(entity_id);
+  if (i < 0) {
+    return;
+  }
+  /* ⚠️ 値は Python の repr の文字列。**JSONではないので解析しない。**
+     実機で観測した形は `[<ColorMode.COLOR_TEMP: 'color_temp'>]` で、
+     素朴な `['color_temp']` ではない（enum が repr のまま文字列化されている）。
+     色モードの語彙に `color_temp` を含む別の値は無いので、部分一致で足りる——
+     **形が変わっても、名前が入っている限り効く**というのがここを解析しない理由。 */
+  const bool capable = value.find("color_temp") != std::string::npos;
+  if (this->ct_capable_[i].exchange(capable) != capable) {
+    ESP_LOGI(TAG, "%s: color temp %s (%s)", entity_id.c_str(), capable ? "available" : "gone",
+             value.c_str());
+  }
+}
+
+bool AstrolabeUI::light_ct_available_(int slot, int *min_k, int *max_k) const {
+  if (slot < 0 || slot >= static_cast<int>(this->slots_.size())) {
+    return false;
+  }
+  if (!this->ct_capable_[slot].load()) {
+    return false;
+  }
+  const int16_t lo = this->ct_min_[slot].load();
+  const int16_t hi = this->ct_max_[slot].load();
+  /* 範囲が無ければ刻めない。⚠️ 能力があると言われていても、**範囲が来るまでは断る**。 */
+  if (lo < 0 || hi < 0 || hi <= lo) {
+    return false;
+  }
+  if (min_k != nullptr) {
+    *min_k = lo;
+  }
+  if (max_k != nullptr) {
+    *max_k = hi;
+  }
+  return true;
+}
+
 void AstrolabeUI::loop() {
   /* 鳴らし終わりの後始末。⚠️ **キューの処理より先**——
      取り出しで時間を食っても、鳴り終わりが延びないようにする。 */
@@ -203,19 +327,26 @@ void AstrolabeUI::loop() {
         if (this->buzzer_ != nullptr) {
           this->buzzer_->update_frequency(static_cast<float>(action.hz));
           this->buzzer_->set_level(BEEP_LEVEL);
-          this->beep_until_ms_ = millis() + BEEP_MS;
+          this->beep_until_ms_ = millis() + action.ms;
         }
         break;
 
       case ActionKind::SET_LIGHT:
-        if (action.is_on) {
+        if (!action.is_on) {
+          ESP_LOGD(TAG, "set %s off", entity.c_str());
+          this->call_homeassistant_service("light.turn_off", {{"entity_id", entity}});
+        } else if (action.color_temp >= 0) {
+          /* ⚠️ **色温度を指定する手段は `light.turn_on` しかない。**
+             だから色温度を送ることは、消えていれば点けることでもある。 */
+          ESP_LOGD(TAG, "set %s ct=%d", entity.c_str(), action.color_temp);
+          this->call_homeassistant_service(
+              "light.turn_on",
+              {{"entity_id", entity}, {"color_temp_kelvin", to_string(action.color_temp)}});
+        } else {
           /* ⚠️ 数値も文字列で渡す（HAが型を寄せる）。ここでJSONを組み立てない。 */
           ESP_LOGD(TAG, "set %s brightness=%d", entity.c_str(), action.brightness);
           this->call_homeassistant_service(
               "light.turn_on", {{"entity_id", entity}, {"brightness", to_string(action.brightness)}});
-        } else {
-          ESP_LOGD(TAG, "set %s off", entity.c_str());
-          this->call_homeassistant_service("light.turn_off", {{"entity_id", entity}});
         }
         break;
     }
@@ -259,8 +390,22 @@ bool AstrolabeUI::open_app_(int index, uint32_t now) {
       this->light_app_.state_received = (st != SlotState::UNKNOWN);
       this->light_app_.is_on = (st == SlotState::ON);
       this->light_app_.brightness = (known >= 0) ? known : 0;
+      /* ⚠️ **開くときは必ず明るさから。** 色温度は長押しで行く場所であって、
+         前回どちらにいたかを覚えていると「開いたら知らない画面だった」になる。 */
+      this->light_app_.mode = LightMode::DIMMER;
+      /* ⚠️ **範囲に収まっていない値は受け取らない。** 収まっていないのは
+         「知らない」であって、端に丸めてよい値ではない。 */
+      this->light_app_.color_temp = -1;
+      int ct_lo = 0;
+      int ct_hi = 0;
+      if (this->light_ct_available_(index, &ct_lo, &ct_hi)) {
+        const int16_t ct = this->color_temp_[index].load();
+        if (ct >= ct_lo && ct <= ct_hi) {
+          this->light_app_.color_temp = ct;
+        }
+      }
       this->app_slot_ = index;
-      this->screen_ = Screen::APP;
+      this->set_screen_(Screen::APP);
       this->last_activity_ms_ = now;
       ESP_LOGI(TAG, "open app: slot %d (%s) br=%d on=%d", index, this->slots_[index].entity_id.c_str(),
                this->light_app_.brightness, static_cast<int>(this->light_app_.is_on));
@@ -273,9 +418,37 @@ bool AstrolabeUI::open_app_(int index, uint32_t now) {
 }
 
 void AstrolabeUI::light_app_input_(Input in, uint32_t now) {
-  if (in == Input::ROTATE_CW || in == Input::ROTATE_CCW) {
-    /* ピンを入れ替えてあるので、素直に CW で明るく。 */
-    this->light_app_.brightness += (in == Input::ROTATE_CW) ? BRIGHTNESS_STEP : -BRIGHTNESS_STEP;
+  if (in != Input::ROTATE_CW && in != Input::ROTATE_CCW) {
+    return;
+  }
+  /* ピンを入れ替えてあるので、素直に CW で増える。 */
+  const bool up = (in == Input::ROTATE_CW);
+
+  int ct_lo = 0;
+  int ct_hi = 0;
+  if (this->light_app_.mode == LightMode::COLOR_TEMP &&
+      this->light_ct_available_(this->app_slot_, &ct_lo, &ct_hi)) {
+    int ct = this->light_app_.color_temp;
+    if (ct < ct_lo || ct > ct_hi) {
+      /* ⚠️ **知らない値からは刻まない。** 最初の一手は範囲の真ん中に置く——
+         ここから先は利用者が選んだ値なので、送ってよくなる。 */
+      ct = (ct_lo + ct_hi) / 2;
+    } else {
+      ct += up ? COLOR_TEMP_STEP : -COLOR_TEMP_STEP;
+    }
+    if (ct > ct_hi) {
+      ct = ct_hi;
+    }
+    if (ct < ct_lo) {
+      ct = ct_lo;
+    }
+    this->light_app_.color_temp = ct;
+    /* ⚠️ **色温度を送ると、消えていれば点く**（`light.turn_on` しか手段が無い）。
+       画面の側も点いた前提に揃えておく——HAのこだまを待つと2秒ちらつく。 */
+    this->light_app_.is_on = true;
+    ESP_LOGD(TAG, "light: ct=%d", ct);
+  } else {
+    this->light_app_.brightness += up ? BRIGHTNESS_STEP : -BRIGHTNESS_STEP;
     if (this->light_app_.brightness > 255) {
       this->light_app_.brightness = 255;
     }
@@ -286,10 +459,28 @@ void AstrolabeUI::light_app_input_(Input in, uint32_t now) {
     if (!this->light_app_.is_on && this->light_app_.brightness > 0) {
       this->light_app_.is_on = true;
     }
-    this->light_app_.last_local_change_ms = now;
-    this->light_app_.publish_pending = true;
     ESP_LOGD(TAG, "light: br=%d", this->light_app_.brightness);
   }
+
+  this->light_app_.last_local_change_ms = now;
+  this->light_app_.publish_pending = true;
+}
+
+void AstrolabeUI::on_touch_long_(uint32_t now) {
+  if (!this->light_ct_available_(this->app_slot_, nullptr, nullptr)) {
+    /* ⚠️ **無音で断る。** 画面にも `DIM｜CLR` を出していないので、
+       ここで鳴らすと「何かが起きた」という嘘になる。 */
+    ESP_LOGD(TAG, "touch: long refused (no color temp)");
+    return;
+  }
+  this->light_app_.mode =
+      (this->light_app_.mode == LightMode::DIMMER) ? LightMode::COLOR_TEMP : LightMode::DIMMER;
+  this->last_activity_ms_ = now;
+  /* ⚠️ **他のどれとも違う音。** 同じ場所を押していても起きることが違うので、
+     目を離していたら音でしか区別がつかない。 */
+  this->beep_(BEEP_HZ_MODE, BEEP_MS_MODE);
+  ESP_LOGI(TAG, "light: mode -> %s",
+           this->light_app_.mode == LightMode::DIMMER ? "DIM" : "CLR");
 }
 
 void AstrolabeUI::light_app_publish_(uint32_t now, bool force) {
@@ -303,17 +494,181 @@ void AstrolabeUI::light_app_publish_(uint32_t now, bool force) {
   this->light_app_.last_publish_ms = now;
   this->light_app_.publish_pending = false;
 
-  const Action a{ActionKind::SET_LIGHT, static_cast<uint8_t>(this->app_slot_),
-                 static_cast<int16_t>(this->light_app_.brightness), this->light_app_.is_on};
+  /* ⚠️ **位置で初期化しない。** かつてここは `Action{kind, slot, brightness, is_on}` と
+     並べて書いていた。あとから `hz` を2番目に挿したとき、**位置が1つずつずれて
+     `slot` に明るさが入り**、`loop()` の範囲検査に弾かれて送信が全部消えた。
+     コンパイラは `-Wnarrowing` の**警告しか出さない**ので、ビルドは通り続ける。
+     名前で代入していれば、メンバを足しても壊れない。 */
+  Action a{};
+  a.kind = ActionKind::SET_LIGHT;
+  a.slot = static_cast<uint8_t>(this->app_slot_);
+  a.brightness = static_cast<int16_t>(this->light_app_.brightness);
+  a.is_on = this->light_app_.is_on;
+  /* ⚠️ **知らない色温度は添えない。** 明るさの面にいるときも添えない——
+     いま利用者がいじっているのはそちらではない。 */
+  a.color_temp = (this->light_app_.mode == LightMode::COLOR_TEMP)
+                     ? static_cast<int16_t>(this->light_app_.color_temp)
+                     : -1;
   xQueueSend(this->action_queue_, &a, 0);
 }
 
-void AstrolabeUI::beep_(uint32_t hz) {
-  const Action a{ActionKind::BEEP, static_cast<uint16_t>(hz), 0, 0, false};
+void AstrolabeUI::beep_(uint32_t hz, uint32_t ms) {
+  Action a{};
+  a.kind = ActionKind::BEEP;
+  a.hz = static_cast<uint16_t>(hz);
+  a.ms = static_cast<uint16_t>(ms);
   xQueueSend(this->action_queue_, &a, 0);
+}
+
+void AstrolabeUI::set_screen_(Screen next) {
+  if (this->screen_ == next) {
+    return;
+  }
+  this->screen_ = next;
+  /* ⚠️ **進行中の接触を取り消す。** 押下と離上は別の時刻の出来事なので、その間に
+     画面が変わると、離した瞬間の動作が**押し始めたのとは違う画面**へ効く。
+     `screen_` への代入をこの関数だけに集めてあるのは、
+     **規則を守るのではなく、破る道を塞ぐため**。 */
+  this->cancel_touch_("screen changed");
+}
+
+void AstrolabeUI::cancel_touch_(const char *why) {
+  if (!this->touch_.down || this->touch_.action_fired) {
+    return;
+  }
+  ESP_LOGD(TAG, "touch: cancelled (%s)", why);
+  /* 指はまだ触れているので `down` は倒さない。**この接触ではもう何もしない**という印だけ立てる。 */
+  this->touch_.action_fired = true;
+}
+
+void AstrolabeUI::poll_touch_(uint32_t now) {
+  /* ⚠️ **`getTouchPointsNum()` 経由で読む。** この呼び出しが `_poll_g_ctrl()`（放置死の計器）
+     も回しているので、読み方を変えると計器が止まる。 */
+  const bool touched = this->tp_.getTouchPointsNum() > 0;
+
+  /* ⚠️ **読めなかったフレームは、指の有無について何も言っていない。**
+     `getTouchPointsNum()` は読み取りに失敗しても `0` を返す。ここで捨てないと、
+     **I2Cが1回こけただけで「指を離した」ことになり、短押しが撃たれる**。
+     押している時間は流れたままでよいので、`down` もタイマも触らずに戻る。 */
+  if (!this->tp_.getTouchReadOk()) {
+    return;
+  }
+
+  /* ── 押下エッジ ── */
+  if (!this->touch_.down) {
+    if (!touched) {
+      return;
+    }
+    this->tp_.update();
+    const auto pt = this->tp_.getTouchPointBuffer();
+    const int dx = pt.x - 120;
+    const int dy = pt.y - 120;
+    const int radius = (this->screen_ == Screen::LAUNCHER) ? CENTER_TAP_RADIUS : APP_TAP_RADIUS;
+
+    this->touch_ = TouchGesture{};
+    this->touch_.down = true;
+    this->touch_.press_ms = now;
+    this->touch_.screen = this->screen_;
+    /* ⚠️ **時計だけは中央に限らない。** 暗い中で手探りで起こす画面なので、
+       起こしやすさを取る。長押しが無いので、どこを触っても意味は1つしかない。 */
+    this->touch_.in_center =
+        (this->screen_ == Screen::CLOCK) || (dx * dx + dy * dy) <= (radius * radius);
+    /* ⚠️ **開く先は押した時点で決める。** 離すまでの間に選択が動いても、
+       開くのは押した方（ノブは接触を取り消すので通常ここは効かないが、
+       「押した位置が意味を持つ」という規則をコードの側に残しておく）。 */
+    this->touch_.slot = (this->screen_ == Screen::LAUNCHER)
+                            ? static_cast<int>(this->menu_->getSelector()->getTargetItem())
+                            : this->app_slot_;
+
+    if (!this->touch_.in_center) {
+      /* ⚠️ 中央の外で押し始めたら、**どれだけ長く押しても**何も起こさない。
+         リング上のアイコンや、ダイヤルの縁を握った手が拾われないようにする。 */
+      ESP_LOGD(TAG, "touch: outside (%d,%d)", pt.x, pt.y);
+      this->touch_.action_fired = true;
+    }
+    return;
+  }
+
+  /* ── 押している間 ── */
+  if (touched) {
+    const uint32_t held = now - this->touch_.press_ms;
+
+    /* ⚠️ **閾値を跨いだ瞬間に撃つ。離すのを待たない。**
+       離してから長押しか短押しかを決めると、**画面は押している間ずっと無反応**になる。 */
+    if (!this->touch_.action_fired && this->touch_.screen == Screen::APP &&
+        held >= TOUCH_LONGPRESS_MS) {
+      this->touch_.action_fired = true;
+      ESP_LOGD(TAG, "touch: long (%ums)", static_cast<unsigned>(held));
+      this->on_touch_long_(now);
+    }
+
+    /* 見限り。⚠️ **`action_fired` とは別に数える**——長押しを撃った指をそのまま置いていても
+       一度は言う必要があり、しかし毎周期言ってはいけない。 */
+    if (!this->touch_.stuck_reported && held >= TOUCH_MAX_PRESS_MS) {
+      this->touch_.stuck_reported = true;
+      this->touch_.action_fired = true;
+      ESP_LOGW(TAG, "touch: stuck (%ums held; controller may be wedged)", static_cast<unsigned>(held));
+    }
+    return;
+  }
+
+  /* ── 離上エッジ ── */
+  const uint32_t held = now - this->touch_.press_ms;
+  this->touch_.down = false;
+  if (this->touch_.action_fired) {
+    return;
+  }
+  if (held < TOUCH_GHOST_MS) {
+    ESP_LOGD(TAG, "touch: ghost (%ums)", static_cast<unsigned>(held));
+    return;
+  }
+  ESP_LOGD(TAG, "touch: short (%ums)", static_cast<unsigned>(held));
+  this->on_touch_short_(now);
+}
+
+void AstrolabeUI::on_touch_short_(uint32_t now) {
+  /* ⚠️ **押し始めた画面**で分岐する。`screen_` は `set_screen_` が取り消すので、
+     ここへ来ている時点で両者は一致しているが、意味の主語は「押し始めた画面」。 */
+  switch (this->touch_.screen) {
+    case Screen::LAUNCHER:
+      this->last_activity_ms_ = now;
+      /* ⚠️ **ボタンと同じ音**。利用者にとっては同じ「決定」なので、
+         入口が違うだけで音が変わると混乱する。 */
+      this->beep_(BEEP_HZ_PRESS);
+      ESP_LOGD(TAG, "launcher: center tap (activity)");
+      this->open_app_(this->touch_.slot, now);
+      return;
+
+    case Screen::CLOCK:
+      /* 時計のタップも起床。 */
+      this->beep_(BEEP_HZ_PRESS);
+      if (!this->open_app_(0, now)) {
+        this->set_screen_(Screen::LAUNCHER);
+        this->last_activity_ms_ = now;
+      }
+      return;
+
+    case Screen::APP:
+      /* アプリの中でのタップはトグル。 */
+      this->last_activity_ms_ = now;
+      this->light_app_.is_on = !this->light_app_.is_on;
+      if (this->light_app_.is_on && this->light_app_.brightness == 0) {
+        this->light_app_.brightness = 128; /* 消灯から点けたときの既定 */
+      }
+      this->light_app_.last_local_change_ms = now;
+      ESP_LOGI(TAG, "light: toggle -> %s", this->light_app_.is_on ? "on" : "off");
+      this->beep_(BEEP_HZ_ACTION);
+      /* ⚠️ トグルは間引かない。押した手応えが遅れるのが一番きらわれる。 */
+      this->light_app_publish_(now, /*force=*/true);
+      return;
+  }
 }
 
 void AstrolabeUI::apply_input_(Input in, uint32_t now) {
+  /* ⚠️ **ノブやボタンが来たら、進行中の接触は取り消す。**
+     押しながら回すと選択が動くので、離した瞬間に**見えているのと違うスロット**が開く。 */
+  this->cancel_touch_("input while touching");
+
   /* ⚠️ **手応えは画面によらず、入力を受けた時点で鳴らす。**
      旧実装はハードウェアのコールバックで鳴らしていたので、
      ランチャーでもアプリでも時計でも同じように鳴っていた。
@@ -337,14 +692,14 @@ void AstrolabeUI::apply_input_(Input in, uint32_t now) {
     case Screen::CLOCK:
       if (in == Input::BUTTON) {
         ESP_LOGI(TAG, "clock -> launcher (button)");
-        this->screen_ = Screen::LAUNCHER;
+        this->set_screen_(Screen::LAUNCHER);
         /* ⚠️ ランチャーへ戻った瞬間から数え直す。ここを忘れると、時計に居た時間が
            そのまま無操作時間として残り、**戻った直後にまた時計へ落ちる**。 */
         this->last_activity_ms_ = now;
       } else {
         /* 起床先は**先頭スロット**。⚠️ 開けなければランチャーへ落とす。 */
         if (!this->open_app_(0, now)) {
-          this->screen_ = Screen::LAUNCHER;
+          this->set_screen_(Screen::LAUNCHER);
           this->last_activity_ms_ = now;
         }
       }
@@ -378,7 +733,7 @@ void AstrolabeUI::apply_input_(Input in, uint32_t now) {
            閉じると、最後にひねったぶんが**投げられずに消える**。 */
         this->light_app_publish_(now, /*force=*/this->light_app_.publish_pending);
         ESP_LOGI(TAG, "app -> launcher (button)");
-        this->screen_ = Screen::LAUNCHER;
+        this->set_screen_(Screen::LAUNCHER);
         this->app_slot_ = -1;
       } else {
         this->light_app_input_(in, now);
@@ -408,65 +763,17 @@ void AstrolabeUI::ui_task_() {
       this->apply_input_(in, now);
     }
 
-    /* タッチ。⚠️ **`getTouchPointsNum()` 経由で読む**——この呼び出しが
-       `_poll_g_ctrl()`（タッチ放置死の計器）も回している。読み方を変えると計器が止まる。
-       ⚠️ **画面によらず毎周期読む。** 時計のときだけ読まないようにすると計器が止まる。 */
-    const bool touched = this->tp_.getTouchPointsNum() > 0;
+    /* タッチ。⚠️ **画面によらず毎周期読む。** 時計のときだけ読まないようにすると計器が止まる。 */
+    this->poll_touch_(now);
 
-    /* ⚠️ **計器の写しを取るのはここ。** 上の `getTouchPointsNum()` が
-       G_CTRL の見張りも回しているので、その直後が最新。
+    /* ⚠️ **計器の写しを取るのはここ。** 上の `poll_touch_()` が `getTouchPointsNum()` を
+       通り、それが G_CTRL の見張りも回しているので、その直後が最新。
        メインループはこの atomic だけを読む（`touch_g_ctrl()` 他）。 */
     this->g_ctrl_last_.store(this->tp_.getGCtrlLast());
     this->g_ctrl_boot_.store(this->tp_.getGCtrlBoot());
     this->g_ctrl_bad_.store(this->tp_.getGCtrlBadCount());
     this->g_ctrl_polls_.store(static_cast<uint32_t>(this->tp_.getGCtrlPollCount()));
-    if (touched && now - this->last_touch_ms_ > TOUCH_DEBOUNCE_MS) {
-      this->last_touch_ms_ = now;
-      this->tp_.update();
-      const auto pt = this->tp_.getTouchPointBuffer();
-      const int dx = pt.x - 120;
-      const int dy = pt.y - 120;
-      const bool in_center = (dx * dx + dy * dy) <= (CENTER_TAP_RADIUS * CENTER_TAP_RADIUS);
-
-      switch (this->screen_) {
-        case Screen::LAUNCHER:
-          /* ⚠️ **中央円の中だけが「開く」。**
-             全画面で拾うと**リング上のアイコンを触っただけで開く**。
-             ⚠️ タップは**アプリを開く**。トグルはアプリの中。 */
-          if (in_center) {
-            this->last_activity_ms_ = now;
-            /* ⚠️ **ボタンと同じ音**。利用者にとっては同じ「決定」なので、
-               入口が違うだけで音が変わると混乱する。 */
-            this->beep_(BEEP_HZ_PRESS);
-            ESP_LOGD(TAG, "launcher: center tap (activity)");
-            this->open_app_(static_cast<int>(this->menu_->getSelector()->getTargetItem()), now);
-          }
-          break;
-
-        case Screen::CLOCK:
-          /* 時計のタップも起床。⚠️ こちらは中央に限らない。 */
-          this->beep_(BEEP_HZ_PRESS);
-          if (!this->open_app_(0, now)) {
-            this->screen_ = Screen::LAUNCHER;
-            this->last_activity_ms_ = now;
-          }
-          break;
-
-        case Screen::APP:
-          /* アプリの中でのタップはトグル。 */
-          this->last_activity_ms_ = now;
-          this->light_app_.is_on = !this->light_app_.is_on;
-          if (this->light_app_.is_on && this->light_app_.brightness == 0) {
-            this->light_app_.brightness = 128;  /* 消灯から点けたときの既定 */
-          }
-          this->light_app_.last_local_change_ms = now;
-          ESP_LOGI(TAG, "light: toggle -> %s", this->light_app_.is_on ? "on" : "off");
-          this->beep_(BEEP_HZ_ACTION);
-          /* ⚠️ トグルは間引かない。押した手応えが遅れるのが一番きらわれる。 */
-          this->light_app_publish_(now, /*force=*/true);
-          break;
-      }
-    }
+    this->tp_read_fail_.store(this->tp_.getTouchReadFailCount());
 
     switch (this->screen_) {
       case Screen::LAUNCHER:
@@ -474,7 +781,7 @@ void AstrolabeUI::ui_task_() {
            そこにタイムアウトを持たせない（`astrolabe_ui.h` の `last_activity_ms_` 参照）。 */
         if (now - this->last_activity_ms_ >= IDLE_TIMEOUT_MS) {
           ESP_LOGI(TAG, "launcher -> clock (idle %ums)", static_cast<unsigned>(IDLE_TIMEOUT_MS));
-          this->screen_ = Screen::CLOCK;
+          this->set_screen_(Screen::CLOCK);
           /* 次の周期で必ず描くように、前回描画時刻を過去へ倒す。 */
           this->last_clock_render_ms_ = now - CLOCK_RENDER_MS;
           break;
@@ -499,7 +806,7 @@ void AstrolabeUI::ui_task_() {
         if (now - this->last_activity_ms_ >= IDLE_TIMEOUT_MS) {
           this->light_app_publish_(now, /*force=*/this->light_app_.publish_pending);
           ESP_LOGI(TAG, "app -> clock (idle)");
-          this->screen_ = Screen::CLOCK;
+          this->set_screen_(Screen::CLOCK);
           this->app_slot_ = -1;
           this->last_clock_render_ms_ = now - CLOCK_RENDER_MS;
           break;
@@ -520,9 +827,41 @@ void AstrolabeUI::ui_task_() {
           }
         }
 
-        this->light_app_publish_(now, /*force=*/false);
-        render_light(this->canvas_, this->light_app_.brightness, this->light_app_.is_on,
-                     this->light_app_.state_received);
+        {
+          /* ⚠️ **能力は毎フレーム読み直す。** 開いたときの写しを使うと、
+             電球を色温度非対応のものへ替えたあとも `DIM｜CLR` を出し続ける。 */
+          int ct_lo = 0;
+          int ct_hi = 0;
+          const bool ct_ok = this->light_ct_available_(this->app_slot_, &ct_lo, &ct_hi);
+
+          if (!ct_ok && this->light_app_.mode == LightMode::COLOR_TEMP) {
+            /* ⚠️ **色温度の面にいる最中に能力が消えたら、その場で明るさへ戻す。**
+               再起動を待たない。 */
+            ESP_LOGI(TAG, "light: color temp no longer available; back to DIM");
+            this->light_app_.mode = LightMode::DIMMER;
+          }
+
+          if (ct_ok && now - this->light_app_.last_local_change_ms >= LOCAL_CHANGE_GUARD_MS) {
+            const int16_t ct = this->color_temp_[this->app_slot_].load();
+            /* ⚠️ 範囲外は取り込まない（丸めない）。 */
+            if (ct >= ct_lo && ct <= ct_hi) {
+              this->light_app_.color_temp = ct;
+            }
+          }
+
+          this->light_app_publish_(now, /*force=*/false);
+
+          LightView view{};
+          view.brightness = this->light_app_.brightness;
+          view.is_on = this->light_app_.is_on;
+          view.state_received = this->light_app_.state_received;
+          view.color_temp_mode = (this->light_app_.mode == LightMode::COLOR_TEMP);
+          view.color_temp = this->light_app_.color_temp;
+          view.color_temp_min = ct_lo;
+          view.color_temp_max = ct_hi;
+          view.color_temp_available = ct_ok;
+          render_light(this->canvas_, view);
+        }
         this->canvas_->pushSprite(0, 0);
         break;
     }
