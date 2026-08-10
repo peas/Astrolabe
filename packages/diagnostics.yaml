@@ -119,6 +119,19 @@ sensor:
     state_class: total_increasing
 
   - platform: template
+    name: Dropped Actions
+    id: astrolabe_dropped_actions
+    entity_category: diagnostic
+    # Times a press or a turn could not be queued for Home Assistant, and was
+    # therefore never sent. This should stay at zero. It is here because for a
+    # `generic` slot one click is one service call: a dropped click is a missing
+    # action, not a slightly smaller change.
+    lambda: 'return id(astrolabe_ui_id)->dropped_actions();'
+    update_interval: 60s
+    accuracy_decimals: 0
+    state_class: total_increasing
+
+  - platform: template
     name: Touch Poll Count
     id: astrolabe_touch_polls
     entity_category: diagnostic
