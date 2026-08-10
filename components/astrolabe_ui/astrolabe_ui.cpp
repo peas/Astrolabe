@@ -29,8 +29,21 @@ void AstrolabeUI::add_slot(uint8_t type, const std::string &entity_id, const std
     ESP_LOGE(TAG, "slot overflow (max %d); dropping %s", SLOTS_MAX, entity_id.c_str());
     return;
   }
-  this->slots_.push_back(SlotConfig{static_cast<SlotType>(type), entity_id, x, y});
-  this->render_slots_.push_back(RenderSlot{tag_up, tag_down, icon});
+  /* ⚠️ **位置で並べない。** メンバを1つ挿されると値が1つずつずれ、
+     コンパイラは（型が近ければ）警告しか出さない。実際に `Action` でそれを踏み、
+     **調光の送信がまるごと捨てられている版を公開した**。名前で書けば起きない。 */
+  SlotConfig cfg{};
+  cfg.type = static_cast<SlotType>(type);
+  cfg.entity_id = entity_id;
+  cfg.x = x;
+  cfg.y = y;
+  this->slots_.push_back(std::move(cfg));
+
+  RenderSlot rs{};
+  rs.tag_up = tag_up;
+  rs.tag_down = tag_down;
+  rs.icon = icon;
+  this->render_slots_.push_back(std::move(rs));
 }
 
 void AstrolabeUI::setup() {
