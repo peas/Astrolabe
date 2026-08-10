@@ -25,9 +25,12 @@ jobs:
         run: pip install esphome
 
       - name: Record the ESPHome version
-        run: |
-          esphome version
-          echo "ESPHOME_VERSION=$(esphome version | sed -n 's/^Version: //p')" >> "$GITHUB_ENV"
+        # Deliberately not pinned. The point of the weekly run is to find out
+        # when a new ESPHome release breaks this, so a red build here means
+        # something real. Whether it still *works on hardware* is a separate
+        # claim that only a person with an M5Dial can make; the README says so
+        # in its own words and is not checked here.
+        run: esphome version
 
       - name: Build the example exactly as published
         # The YAML printed in README.md is generated from examples/m5dial.yaml,
@@ -87,21 +90,18 @@ jobs:
           print("README matches examples/m5dial.yaml")
           PY
 
-      - name: Check that "last verified" is not older than what we just built
-        # README says "or newer (last verified: X)". If CI builds a newer
-        # ESPHome and X is not updated, the README claims something nobody
-        # checked. Failing here is the reminder to update it.
+      - name: Check that the README's stated minimum matches the package
+        # Two places state the floor. If they drift, one of them is lying.
         run: |
           python - <<'PY'
-          import os, pathlib, re, sys
+          import pathlib, re, sys
           readme = pathlib.Path('README.md').read_text()
-          m = re.search(r"last verified: ([0-9]+\.[0-9]+\.[0-9]+)", readme)
-          if m is None:
-              sys.exit("README.md has no 'last verified' marker")
-          claimed, built = m.group(1), os.environ["ESPHOME_VERSION"]
-          print(f"README claims {claimed}; CI built {built}")
-          if claimed != built:
-              sys.exit(
-                  f"README says 'last verified: {claimed}' but this build used "
-                  f"{built}. Update the README, having checked it on hardware.")
+          package = pathlib.Path('packages/m5dial.yaml').read_text()
+          claimed = re.search(r"ESPHome ([0-9]+\.[0-9]+\.[0-9]+) or newer", readme)
+          enforced = re.search(r"min_version: ([0-9]+\.[0-9]+\.[0-9]+)", package)
+          if claimed is None or enforced is None:
+              sys.exit("could not find the version in README.md or packages/m5dial.yaml")
+          if claimed.group(1) != enforced.group(1):
+              sys.exit(f"README says {claimed.group(1)}, min_version says {enforced.group(1)}")
+          print(f"minimum agrees: {claimed.group(1)}")
           PY

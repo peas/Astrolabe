@@ -1,5 +1,7 @@
 # Astrolabe
 
+[![CI](https://github.com/Khronos31/Astrolabe/actions/workflows/ci.yml/badge.svg)](https://github.com/Khronos31/Astrolabe/actions/workflows/ci.yml)
+
 Turn an [M5Dial](https://docs.m5stack.com/en/core/M5Dial) into a physical
 Home Assistant controller: a ring of icons you turn through with the knob,
 tap to open, and turn again to dim.
@@ -15,8 +17,7 @@ Home Assistant integration to install.
 ## Requirements
 
 - An M5Dial (ESP32-S3, 8 MB flash)
-- ESPHome 2025.11.0 or newer (last verified: 2025.11.0) — the ESPHome Device
-  Builder add-on is fine
+- ESPHome 2025.11.0 or newer — the ESPHome Device Builder add-on is fine
 - Home Assistant, reachable over your network
 
 This repository is source-only. You build the firmware yourself; no prebuilt
@@ -25,15 +26,24 @@ machine.
 
 ### About versions
 
-`min_version` stops the build on anything older than 2025.11.0, but there is no
-way to declare an upper bound, so a future ESPHome release could break this and
-you would find out by building. "Last verified" above is the newest release this
-was actually built and run against; a stale date there means nobody has checked
-recently. A weekly CI build is what keeps it honest.
+Three different claims, which are worth keeping apart.
+
+**It will not build on anything older than 2025.11.0.** `min_version` enforces
+that.
+
+**It builds on the current ESPHome.** There is no way to declare an upper bound,
+so a future release could break this. CI builds the example against whatever
+ESPHome is current, on every push and once a week; the badge above is that
+result, and a red badge means a release has broken something.
+
+**It was last run on hardware with ESPHome 2025.11.0.** Only somebody holding an
+M5Dial can make that claim, so it is not checked by CI and it will go stale. If
+that version looks old to you, treat newer ESPHome releases as building but
+unproven on a real device.
 
 Two dependencies are pinned exactly and fetched at build time: LovyanGFX 1.2.26
 and the Material Design Icons webfont 7.4.47. ESP-IDF is whatever your ESPHome
-release selects — 5.5.1 at the time of writing — and is not pinned here.
+release selects and is not pinned here.
 
 ## Quick start
 
