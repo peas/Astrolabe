@@ -7,6 +7,7 @@
 #include "esphome/core/log.h"
 
 #include "clock_render.hpp"
+#include "cover_render.hpp"
 #include "generic_render.hpp"
 #include "light_render.hpp"
 
@@ -82,6 +83,15 @@ void AstrolabeUI::setup() {
   }
   for (auto &c : this->ct_max_) {
     c.store(-1);
+  }
+  for (auto &c : this->cover_position_) {
+    c.store(-1);
+  }
+  for (auto &c : this->cover_state_) {
+    c.store(static_cast<uint8_t>(CoverState::UNKNOWN));
+  }
+  for (auto &c : this->cover_features_) {
+    c.store(0);
   }
   for (auto &c : this->ct_capable_) {
     /* ⚠️ **既定は「対応していない」。** 届く前と非対応を同じ扱いにする——
@@ -168,6 +178,11 @@ void AstrolabeUI::setup() {
       this->subscribe_homeassistant_state(&AstrolabeUI::on_ha_ct_min_, s.entity_id, "min_color_temp_kelvin");
       this->subscribe_homeassistant_state(&AstrolabeUI::on_ha_ct_max_, s.entity_id, "max_color_temp_kelvin");
       ESP_LOGCONFIG(TAG, "  subscribe %s: brightness, color temp (4)", s.entity_id.c_str());
+    } else if (s.type == SlotType::COVER) {
+      this->subscribe_homeassistant_state(&AstrolabeUI::on_ha_cover_position_, s.entity_id, "current_position");
+      /* ⚠️ **できることのビット。** 位置指定を持たない機器でノブを効かせないため。 */
+      this->subscribe_homeassistant_state(&AstrolabeUI::on_ha_cover_features_, s.entity_id, "supported_features");
+      ESP_LOGCONFIG(TAG, "  subscribe %s: position, features", s.entity_id.c_str());
     }
   }
 
@@ -185,6 +200,22 @@ void AstrolabeUI::on_ha_state_(std::string entity_id, std::string state) {
   for (size_t i = 0; i < this->slots_.size(); i++) {
     if (this->slots_[i].entity_id != entity_id) {
       continue;
+    }
+    if (this->slots_[i].type == SlotType::COVER) {
+      /* ⚠️ **カーテンの語彙は ON/OFF ではない。** ライトの解釈に混ぜない。 */
+      CoverState cs = CoverState::UNKNOWN;
+      if (state == "open") {
+        cs = CoverState::OPEN;
+      } else if (state == "closed") {
+        cs = CoverState::CLOSED;
+      } else if (state == "opening") {
+        cs = CoverState::OPENING;
+      } else if (state == "closing") {
+        cs = CoverState::CLOSING;
+      }
+      this->cover_state_[i].store(static_cast<uint8_t>(cs));
+      ESP_LOGD(TAG, "%s -> %s", entity_id.c_str(), state.c_str());
+      return;
     }
     SlotState v;
     if (state == "on") {
@@ -323,6 +354,40 @@ void AstrolabeUI::on_ha_color_modes_(std::string entity_id, std::string value) {
   }
 }
 
+void AstrolabeUI::on_ha_cover_position_(std::string entity_id, std::string value) {
+  const int i = this->slot_index_(entity_id);
+  if (i < 0) {
+    return;
+  }
+  float v = 0.0f;
+  if (!parse_number(value, &v)) {
+    /* ⚠️ **位置を持たないカーテンもある**（開閉だけの機器）。その場合ここへは来ないが、
+       `None` が来ることはある。**0に倒さない。** */
+    this->cover_position_[i].store(-1);
+    ESP_LOGW(TAG, "%s.current_position: '%s' is not a number; treating as absent", entity_id.c_str(),
+             value.c_str());
+    return;
+  }
+  this->cover_position_[i].store(static_cast<int16_t>(v));
+  ESP_LOGD(TAG, "%s.current_position -> %d", entity_id.c_str(), static_cast<int>(v));
+}
+
+void AstrolabeUI::on_ha_cover_features_(std::string entity_id, std::string value) {
+  const int i = this->slot_index_(entity_id);
+  if (i < 0) {
+    return;
+  }
+  float v = 0.0f;
+  if (!parse_number(value, &v)) {
+    return;
+  }
+  const uint32_t bits = static_cast<uint32_t>(v);
+  if (this->cover_features_[i].exchange(bits) != bits) {
+    ESP_LOGI(TAG, "%s: cover features %u (position=%s stop=%s)", entity_id.c_str(), bits,
+             (bits & COVER_FEAT_SET_POSITION) ? "yes" : "no", (bits & COVER_FEAT_STOP) ? "yes" : "no");
+  }
+}
+
 bool AstrolabeUI::light_ct_available_(int slot, int *min_k, int *max_k) const {
   if (slot < 0 || slot >= static_cast<int>(this->slots_.size())) {
     return false;
@@ -406,6 +471,18 @@ void AstrolabeUI::loop() {
         this->call_homeassistant_service(target.service, {{"entity_id", target.entity_id}});
         break;
       }
+
+      case ActionKind::COVER_ACTION:
+        ESP_LOGI(TAG, "cover %s %s", action.cover_service, entity.c_str());
+        this->call_homeassistant_service(std::string("cover.") + action.cover_service,
+                                         {{"entity_id", entity}});
+        break;
+
+      case ActionKind::SET_COVER_POSITION:
+        ESP_LOGD(TAG, "set %s position=%d", entity.c_str(), action.position);
+        this->call_homeassistant_service("cover.set_cover_position",
+                                         {{"entity_id", entity}, {"position", to_string(action.position)}});
+        break;
 
       case ActionKind::SET_LIGHT:
         if (!action.is_on) {
@@ -498,8 +575,24 @@ bool AstrolabeUI::open_app_(int index, uint32_t now) {
       return true;
     }
 
+    case SlotType::COVER: {
+      this->cover_app_ = CoverAppState{};
+      /* ⚠️ **範囲は 0-100 で固定。** カーテンの位置は割合なので、機器ごとに違わない
+         （温度や色温度と違うところ）。 */
+      this->cover_app_.position.set_bounds(0.0f, 100.0f);
+      const int16_t pos = this->cover_position_[index].load();
+      if (pos >= 0) {
+        this->cover_app_.position.set_reported(static_cast<float>(pos));
+      }
+      this->cover_app_.state = static_cast<CoverState>(this->cover_state_[index].load());
+      this->app_slot_ = index;
+      this->set_screen_(Screen::APP);
+      this->last_activity_ms_ = now;
+      ESP_LOGI(TAG, "open app: slot %d (cover) pos=%d", index, pos);
+      return true;
+    }
+
     case SlotType::CLIMATE:
-    case SlotType::COVER:
     case SlotType::MEDIA_PLAYER:
       /* ⚠️ **まだ画面が無い。** 黙って開いて何も出さないより、開かない方がよい。 */
       break;
@@ -561,6 +654,20 @@ void AstrolabeUI::light_app_input_(Input in, uint32_t now) {
 }
 
 void AstrolabeUI::on_touch_long_(uint32_t now) {
+  if (this->app_slot_ >= 0 && this->slots_[this->app_slot_].type == SlotType::COVER) {
+    if (!(this->cover_features_[this->app_slot_].load() & COVER_FEAT_STOP)) {
+      /* ⚠️ **止められない機器では無音で断る**（案内にも出していない）。 */
+      ESP_LOGD(TAG, "cover: stop not supported");
+      return;
+    }
+    this->beep_(BEEP_HZ_MODE, BEEP_MS_MODE);
+    ESP_LOGI(TAG, "cover: stop");
+    this->cover_action_("stop_cover", now);
+    /* ⚠️ **止めたら、送りかけの位置は捨てる。** 止めた直後に古い目標が飛ぶと、
+       止めたつもりのカーテンがまた動き出す。 */
+    this->cover_app_.publish_pending = false;
+    return;
+  }
   if (this->app_slot_ >= 0 && this->slots_[this->app_slot_].type == SlotType::GENERIC) {
     this->fire_gesture_(Gesture::HOLD, now);
     return;
@@ -654,6 +761,70 @@ void AstrolabeUI::fire_gesture_(Gesture g, uint32_t now) {
   this->generic_app_.at_ms = now;
 }
 
+void AstrolabeUI::cover_app_input_(Input in, uint32_t now) {
+  if (in != Input::ROTATE_CW && in != Input::ROTATE_CCW) {
+    return;
+  }
+  if (!(this->cover_features_[this->app_slot_].load() & COVER_FEAT_SET_POSITION)) {
+    /* ⚠️ **位置指定を持たない機器では、ノブを効かせない。** 動かない目盛りを見せない。 */
+    ESP_LOGD(TAG, "cover: no set_position; knob refused");
+    return;
+  }
+  /* ⚠️ **右回しで閉じる。** ピンを入れ替えてあるので CW が「増える側」だが、
+     カーテンは**閉じる方向が増える**という感覚に合わせてある（参照実装と同じ）。 */
+  const float delta = (in == Input::ROTATE_CW) ? -COVER_POSITION_STEP : COVER_POSITION_STEP;
+  if (!this->cover_app_.position.step(delta)) {
+    /* ⚠️ **位置を知らないうちは動かさない。** 恣意的な起点から動かすと、
+       「少し開けたい」が「全開」になりうる。 */
+    ESP_LOGD(TAG, "cover: position unknown; knob does nothing");
+    return;
+  }
+  this->cover_app_.last_local_change_ms = now;
+  this->cover_app_.publish_pending = true;
+  ESP_LOGD(TAG, "cover: target=%d", static_cast<int>(this->cover_app_.position.value()));
+}
+
+void AstrolabeUI::cover_app_publish_(uint32_t now) {
+  if (!this->cover_app_.publish_pending) {
+    return;
+  }
+  /* ⚠️ **回している間は送らない。** 手が止まって静定してから、最終位置だけ送る——
+     逐次送ると**物理カーテンの移動が毎回割り込まれ、ほとんど動かない**。
+     ⚠️ ここが他の種別（120msの間引き）と違うところ。 */
+  if (now - this->cover_app_.last_local_change_ms < COVER_SETTLE_MS) {
+    return;
+  }
+  float pos = 0.0f;
+  if (!this->cover_app_.position.to_send(&pos)) {
+    /* ⚠️ **確からしくない値は送らない。** */
+    this->cover_app_.publish_pending = false;
+    return;
+  }
+  this->cover_app_.publish_pending = false;
+
+  Action a{};
+  a.kind = ActionKind::SET_COVER_POSITION;
+  a.slot = static_cast<uint8_t>(this->app_slot_);
+  a.position = static_cast<int16_t>(pos);
+  if (xQueueSend(this->action_queue_, &a, 0) != pdTRUE) {
+    this->dropped_actions_.fetch_add(1);
+    ESP_LOGW(TAG, "cover position dropped: action queue full");
+  }
+}
+
+void AstrolabeUI::cover_action_(const char *service, uint32_t now) {
+  Action a{};
+  a.kind = ActionKind::COVER_ACTION;
+  a.slot = static_cast<uint8_t>(this->app_slot_);
+  a.cover_service = service;
+  if (xQueueSend(this->action_queue_, &a, 0) != pdTRUE) {
+    this->dropped_actions_.fetch_add(1);
+    ESP_LOGW(TAG, "cover action dropped: action queue full");
+  }
+  this->cover_app_.last_local_change_ms = now;
+  this->last_activity_ms_ = now;
+}
+
 void AstrolabeUI::app_input_(Input in, uint32_t now) {
   if (this->app_slot_ < 0) {
     return;
@@ -666,8 +837,10 @@ void AstrolabeUI::app_input_(Input in, uint32_t now) {
     case SlotType::GENERIC:
       this->fire_gesture_(in == Input::ROTATE_CW ? Gesture::ROTATE_RIGHT : Gesture::ROTATE_LEFT, now);
       return;
-    case SlotType::CLIMATE:
     case SlotType::COVER:
+      this->cover_app_input_(in, now);
+      return;
+    case SlotType::CLIMATE:
     case SlotType::MEDIA_PLAYER:
       /* まだ実装していない。⚠️ **開けないので、ここへは来ない**（`open_app_` が断る）。 */
       return;
@@ -805,6 +978,27 @@ void AstrolabeUI::on_touch_short_(uint32_t now) {
     case Screen::APP:
       if (this->app_slot_ >= 0 && this->slots_[this->app_slot_].type == SlotType::GENERIC) {
         this->fire_gesture_(Gesture::TAP, now);
+        return;
+      }
+      if (this->app_slot_ >= 0 && this->slots_[this->app_slot_].type == SlotType::COVER) {
+        /* ⚠️ **半分より開いていれば閉じる、でなければ開く。**
+           位置を知らないときは「開く」に倒す——⚠️ **閉じる方が取り返しがつかない**
+           （夜に勝手に開くより、朝に勝手に閉まる方が困る）。 */
+        const uint32_t feat = this->cover_features_[this->app_slot_].load();
+        const auto &pos = this->cover_app_.position;
+        const bool closing = pos.usable() && pos.value() >= COVER_HALFWAY;
+        const uint32_t need = closing ? COVER_FEAT_CLOSE : COVER_FEAT_OPEN;
+        if (!(feat & need)) {
+          ESP_LOGD(TAG, "cover: %s not supported", closing ? "close" : "open");
+          return;
+        }
+        this->beep_(BEEP_HZ_ACTION);
+        ESP_LOGI(TAG, "cover: %s", closing ? "close" : "open");
+        this->cover_action_(closing ? "close_cover" : "open_cover", now);
+        /* ⚠️ **こちらの目標も端へ寄せる。** そうしないと、動いている間ずっと
+           古い目標値が画面に出続ける。 */
+        this->cover_app_.position.set_chosen(closing ? 0.0f : 100.0f);
+        this->cover_app_.publish_pending = false;
         return;
       }
       /* アプリの中でのタップはトグル。 */
@@ -989,6 +1183,45 @@ void AstrolabeUI::ui_task_() {
                               !slot.gestures[static_cast<int>(Gesture::ROTATE_LEFT)].service.empty();
             render_generic(this->canvas_, view);
           }
+          this->canvas_->pushSprite(0, 0);
+          break;
+        }
+
+        if (this->app_slot_ >= 0 && this->slots_[this->app_slot_].type == SlotType::COVER) {
+          if (now - this->last_activity_ms_ >= IDLE_TIMEOUT_MS) {
+            /* ⚠️ **戻る前に、溜まっている目標を出し切る。** 静定待ちの最中に閉じると
+               最後に回したぶんが投げられずに消える。 */
+            this->cover_app_.last_local_change_ms = 0;
+            this->cover_app_publish_(now);
+            ESP_LOGI(TAG, "app -> clock (idle)");
+            this->set_screen_(Screen::CLOCK);
+            this->app_slot_ = -1;
+            this->last_clock_render_ms_ = now - CLOCK_RENDER_MS;
+            break;
+          }
+
+          const uint32_t feat = this->cover_features_[this->app_slot_].load();
+          this->cover_app_.state = static_cast<CoverState>(this->cover_state_[this->app_slot_].load());
+          /* HAからのこだま。⚠️ **ローカル操作の直後は無視する**——
+             動いている最中の値で目標を上書きすると、ノブと綱引きになる。 */
+          if (now - this->cover_app_.last_local_change_ms >= LOCAL_CHANGE_GUARD_MS) {
+            const int16_t pos = this->cover_position_[this->app_slot_].load();
+            if (pos >= 0) {
+              this->cover_app_.position.set_reported(static_cast<float>(pos));
+            } else {
+              this->cover_app_.position.clear_reported();
+            }
+          }
+          this->cover_app_publish_(now);
+
+          CoverView view{};
+          view.position = this->cover_app_.position.usable()
+                              ? static_cast<int>(this->cover_app_.position.value())
+                              : -1;
+          view.state = static_cast<uint8_t>(this->cover_app_.state);
+          view.can_set_position = (feat & COVER_FEAT_SET_POSITION) != 0;
+          view.can_stop = (feat & COVER_FEAT_STOP) != 0;
+          render_cover(this->canvas_, view);
           this->canvas_->pushSprite(0, 0);
           break;
         }

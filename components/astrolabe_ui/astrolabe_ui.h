@@ -11,6 +11,7 @@
 #include "esphome/components/ledc/ledc_output.h"
 #include "esphome/core/component.h"
 
+#include "ha_value.h"
 #include "hal_display.hpp"
 #include "hal_tp.hpp"
 #include "launcher_render.hpp"
@@ -126,6 +127,15 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
 
   /** 明るさの1目盛り。 */
   static constexpr int BRIGHTNESS_STEP = 8;
+  /** カーテンの1目盛り（%）。 */
+  static constexpr int COVER_POSITION_STEP = 5;
+  /** ⚠️ **カーテンだけ送信の方針が違う。** 回している間は送らず、
+   * **手が止まってからこの時間だけ待って、最終位置だけ**送る。
+   * 逐次送ると**物理カーテンの移動が毎回割り込まれ、ほとんど動かない**。 */
+  static constexpr uint32_t COVER_SETTLE_MS = 400;
+  /** タップで開くか閉じるかの境目（%）。 */
+  static constexpr int COVER_HALFWAY = 50;
+
   /** 色温度の1目盛り（K）。⚠️ **範囲と違ってこれは固定**——
    * 範囲は個体ごとに違うので Home Assistant に従うが、刻みの粗さは好みの問題で、
    * 「同じ製品の別の個体で当然に違うもの」ではない。 */
@@ -195,7 +205,7 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
 
   /** 描画タスク → メインループ。**Home Assistant を呼ぶ意図。**
    * ⚠️ `SET_LIGHT` は `slot` と `brightness` を伴うので、単なる列挙ではなく構造体で渡す。 */
-  enum class ActionKind : uint8_t { TOGGLE_SLOT, SET_LIGHT, BEEP, CALL_GESTURE };
+  enum class ActionKind : uint8_t { TOGGLE_SLOT, SET_LIGHT, BEEP, CALL_GESTURE, COVER_ACTION, SET_COVER_POSITION };
 
   struct Action {
     ActionKind kind;
@@ -211,6 +221,12 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
     int16_t color_temp;
     /** `CALL_GESTURE` のときにどのジェスチャか。 */
     uint8_t gesture;
+    /** `COVER_ACTION` のときのサービス名。⚠️ **キューに文字列は載せられない**ので、
+     * `cover.` に続く部分を指す**フラッシュ常駐のポインタ**を渡す
+     * （`"open_cover"` などの文字列リテラル。所有しない）。 */
+    const char *cover_service;
+    /** `SET_COVER_POSITION` のときの 0-100。 */
+    int16_t position;
     bool is_on;
   };
 
@@ -240,6 +256,24 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
    * 「送った」は利用者の知りたいことに答えていない。答えられるのは
    * **こちらがどう解釈したか**で、⚠️ **実際に起きる取り違えもそこ**——
    * タップのつもりが長押しになる（閾値500ms）。 */
+  /** カーテンの状態。⚠️ ライトの ON/OFF とは別の語彙なので、混ぜない。 */
+  enum class CoverState : uint8_t { UNKNOWN, OPEN, CLOSED, OPENING, CLOSING };
+
+  /** ⚠️ **Home Assistant の `supported_features` のビット**（`cover/const.py`）。
+   * 持っていない機能は**断る**——0.1.1の色温度と同じ作法。 */
+  static constexpr uint32_t COVER_FEAT_OPEN = 1;
+  static constexpr uint32_t COVER_FEAT_CLOSE = 2;
+  static constexpr uint32_t COVER_FEAT_SET_POSITION = 4;
+  static constexpr uint32_t COVER_FEAT_STOP = 8;
+
+  struct CoverAppState {
+    /** 0-100。⚠️ **範囲つきの値**なので、未着なら回しても動かず、送りもしない。 */
+    HaRange position;
+    CoverState state;
+    uint32_t last_local_change_ms;
+    bool publish_pending;
+  };
+
   struct GenericAppState {
     /** 直前に撃ったもの。`Gesture::COUNT` ＝ 何も撃っていない。 */
     Gesture fired;
@@ -329,6 +363,12 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
   void app_input_(Input in, uint32_t now);
   /** 調光画面での入力。⚠️ 描画タスクからのみ。 */
   void light_app_input_(Input in, uint32_t now);
+  /** カーテンでの入力。⚠️ 描画タスクからのみ。 */
+  void cover_app_input_(Input in, uint32_t now);
+  /** ⚠️ **静定してから最終位置だけ**送る。 */
+  void cover_app_publish_(uint32_t now);
+  /** `cover.open_cover` などを積む。 */
+  void cover_action_(const char *service, uint32_t now);
   /** `generic` のジェスチャを撃つ。⚠️ **設定されていなければ何もせず、鳴らさない。**
    * ⚠️ **回転でも案内を光らせる**——語が明るくなるだけなら回し続ける邪魔にならない
    * （「結果画面を挟むと回せない」という理由には当たらない）。 */
@@ -345,6 +385,8 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
   void on_ha_ct_max_(std::string entity_id, std::string value);
   /** ⚠️ 値は Python の repr の文字列（`"['color_temp']"`）。JSONではない。 */
   void on_ha_color_modes_(std::string entity_id, std::string value);
+  void on_ha_cover_position_(std::string entity_id, std::string value);
+  void on_ha_cover_features_(std::string entity_id, std::string value);
   /** entity_id からスロット番号。見つからなければ `-1`。 */
   int slot_index_(const std::string &entity_id) const;
   /** スロット `slot` で**いま**色温度をいじれるか。いじれるなら範囲も返す。
@@ -383,6 +425,13 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
    * 一度立てたら降ろさない旗にすると、**電球を替えたときに嘘をつく**
    * （ビルド時に焼き込む案を却下したのと同じ理由が、実行時にもそのまま当てはまる）。 */
   std::atomic<bool> ct_capable_[SLOTS_MAX];
+
+  /* ── カーテン ── */
+  /** 現在位置（%）。`-1` ＝ まだ届いていない。 */
+  std::atomic<int16_t> cover_position_[SLOTS_MAX];
+  std::atomic<uint8_t> cover_state_[SLOTS_MAX];
+  /** ⚠️ **できることのビット。** 位置指定を持たない機器でノブを効かせない。 */
+  std::atomic<uint32_t> cover_features_[SLOTS_MAX];
 
   /* タッチ計器の写し。**描画タスクが書き、メインループが読む。**
    * ⚠️ 生の値はタッチドライバの中にあるが、そこは描画タスクの持ち物なので直接読ませない。 */
@@ -424,6 +473,7 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
   int app_slot_{-1};
   LightAppState light_app_{};
   GenericAppState generic_app_{};
+  CoverAppState cover_app_{};
 };
 
 }  // namespace astrolabe_ui
