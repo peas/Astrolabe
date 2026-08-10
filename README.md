@@ -36,7 +36,7 @@ so a future release could break this. CI builds the example against whatever
 ESPHome is current, on every push and once a week; the badge above is that
 result, and a red badge means a release has broken something.
 
-**It was last run on hardware with ESPHome 2025.11.0.** Only somebody holding an
+**It was last run on hardware with ESPHome 2026.7.4.** Only somebody holding an
 M5Dial can make that claim, so it is not checked by CI and it will go stale. If
 that version looks old to you, treat newer ESPHome releases as building but
 unproven on a real device.
@@ -84,7 +84,7 @@ substitutions:
 packages:
   astrolabe:
     url: https://github.com/Khronos31/Astrolabe
-    ref: v0.1.0
+    ref: v0.1.1
     file: packages/m5dial.yaml
     # Pinned to a tag, so there is nothing to re-fetch. Keep `never`.
     refresh: never
@@ -127,13 +127,14 @@ astrolabe_ui:
       icon: mdi:bed
 
 # ── Optional: diagnostics ──
-# Add one more entry under `packages:` to expose heap, loop time, touch health
-# and verbose logs. Leave it out for normal use; the verbose log strings are
-# removed at compile time, so this is smaller as well as quieter.
+# Add one more entry under `packages:` to expose heap, loop time, touch health,
+# which build is running, and verbose logs. Leave it out for normal use; the
+# verbose log strings are removed at compile time, so this is smaller as well
+# as quieter.
 #
 #     astrolabe_diagnostics:
 #       url: https://github.com/Khronos31/Astrolabe
-#       ref: v0.1.0
+#       ref: v0.1.1
 #       file: packages/diagnostics.yaml
 #       refresh: never
 ```
@@ -145,11 +146,35 @@ Three screens.
 | | |
 |---|---|
 | **Launcher** | The ring. Turn the knob to move between slots; the selected icon grows. Press the knob, or tap the middle of the screen, to open it. |
-| **App** | For a light: an arc showing brightness, and ON/OFF. Turn to dim, tap to toggle, press the knob to go back. |
+| **App** | For a light: an arc showing brightness, and ON/OFF. Turn to dim, tap to toggle, press the knob to go back. Hold the middle for half a second to switch between brightness and colour temperature. |
 | **Clock** | After twenty seconds of no input. Turn or tap to wake into the first slot; press the knob for the launcher. |
 
 Only the middle of the launcher opens a slot, so brushing an icon on the ring
-does nothing.
+does nothing. Inside an app the touch target is the middle too, so resting a
+hand on the rim of the dial cannot switch anything.
+
+### Colour temperature
+
+Holding the middle of a light's screen switches between brightness (`DIM`) and
+colour temperature (`CLR`). The switch happens the moment you cross half a
+second, not when you let go.
+
+The range and the step come from the light itself: Home Assistant reports
+`min_color_temp_kelvin` and `max_color_temp_kelvin`, and Astrolabe turns in
+200 K steps between them. Nothing about colour temperature is configured here.
+
+**If a light cannot do colour temperature, holding does nothing and stays
+silent, and no `DIM | CLR` marker appears.** That is deliberate: a control you
+cannot reach should not look reachable. It follows the light's current
+capabilities, so swapping the bulb for one that cannot do colour temperature
+takes the mode away without a rebuild.
+
+Colour temperature can only be set by turning a light on, so turning the knob
+in `CLR` while the light is off will switch it on.
+
+When Astrolabe has not been told a usable colour temperature yet, the screen
+shows `----K` and draws no arc, and turning the light on will not send one. It
+does not guess a value and send that back to you.
 
 Sounds tell you what the device thinks you did, without looking at it:
 
@@ -158,6 +183,7 @@ Sounds tell you what the device thinks you did, without looking at it:
 | Knob, clockwise / anticlockwise | 6 kHz / 7 kHz — different, so you can hear which way you turned |
 | Knob pressed, or a tap that opens something | 2 kHz |
 | Something changed (toggled, woken) | 4 kHz |
+| Switched between brightness and colour temperature | 3 kHz, slightly longer — the screen now means something different |
 
 Set `sound: false` if the device sits somewhere you would rather it stayed
 quiet.
@@ -191,16 +217,22 @@ in that release works; a name that does not exist fails the build.
 
 ### Diagnostics
 
-Heap, loop time and touch-panel health, plus verbose logs. Off by default.
-See [`packages/diagnostics.yaml`](packages/diagnostics.yaml) for how to add it
-and what each value means.
+Heap, loop time, touch-panel health, which build is running and why it last
+restarted, plus verbose logs. Off by default. See
+[`packages/diagnostics.yaml`](packages/diagnostics.yaml) for how to add it and
+what each value means.
+
+`Build` and `Slots` are worth knowing about before you need them: the boot
+banner that would answer "which firmware is this, and how many slots does it
+have?" is written before a log viewer can attach, so it is gone by the time you
+go looking.
 
 ## Scope
 
-This release does `light`. The remaining domains from the device this grew out
-of — `climate`, `cover`, `media_player`, and a `generic` slot whose gestures
-call whatever entities you name — are planned, along with colour temperature
-control for lights.
+This release does `light`, with brightness and colour temperature. The
+remaining domains from the device this grew out of — `climate`, `cover`,
+`media_player`, and a `generic` slot whose gestures call whatever entities you
+name — are planned.
 
 If you want to change something this does not expose — pin assignments, the
 idle timeout, the geometry of the ring, the sounds — copy

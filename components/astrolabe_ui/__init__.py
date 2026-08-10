@@ -42,7 +42,7 @@ CONF_SLOTS = "slots"
 CONF_TAG_UP = "tag_up"
 CONF_TAG_DOWN = "tag_down"
 
-#: 0.1.0 が扱う種別 → 期待する entity のドメイン。
+#: いま扱う種別 → 期待する entity のドメイン。
 #: ⚠️ **増やすときは C++ 側の `SlotType` と、下の `SLOT_TYPE_IDS` を一緒に増やす。**
 #: ⚠️ 0.2.0 で足す種別は `climate` / `cover` / `media_player` / `generic`（決定D4）。
 #:    **種別名は entity のドメインと一致させる**——一致していれば下の検証が表を持たずに済む。

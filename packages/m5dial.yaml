@@ -12,7 +12,7 @@ substitutions:
   friendly_name: Astrolabe
   # Self-reference: which version of the component to pull in.
   # Bumping a release means changing this one line.
-  astrolabe_source: github://Khronos31/Astrolabe@v0.1.0
+  astrolabe_source: github://Khronos31/Astrolabe@v0.1.1
 
 esphome:
   name: ${name}
@@ -23,7 +23,7 @@ esphome:
   min_version: 2025.11.0
   project:
     name: Khronos31.Astrolabe
-    version: "0.1.0"
+    version: "0.1.1"
 
 logger:
   # Release default. ESPHome strips log calls below this level at compile time,
