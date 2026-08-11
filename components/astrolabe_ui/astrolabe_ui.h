@@ -239,7 +239,10 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
     std::string entity_id;
   };
 
-  /** 布がどちら側から伸びるか。⚠️ **見た目だけ**——操作の意味は変わらない。
+  /** 布がどちら側から伸びるか。
+   * ⚠️ **見た目だけではない**——`RIGHT` は**ノブの向きも反転する**。
+   * 布の縁が反時計回りに伸びるので、そのままだと右回しで縁が左へ動く。
+   * 詳細は `cover_app_input_`。
    * ⚠️ Python側 `COVER_OPENINGS` と一緒に増やす。 */
   enum class CoverOpening : uint8_t { CENTER = 0, LEFT = 1, RIGHT = 2 };
 

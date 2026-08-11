@@ -768,9 +768,22 @@ void AstrolabeUI::cover_app_input_(Input in, uint32_t now) {
     ESP_LOGD(TAG, "cover: no set_position; knob refused");
     return;
   }
-  /* ⚠️ **右回しで閉じる。** ピンを入れ替えてあるので CW が「増える側」だが、
-     カーテンは**閉じる方向が増える**という感覚に合わせてある（参照実装と同じ）。 */
-  const float delta = (in == Input::ROTATE_CW) ? -COVER_POSITION_STEP : COVER_POSITION_STEP;
+  /* ⚠️ **ノブは布の縁を引っぱる。** 右に回したら、画面の布の縁も**時計回りに動く**。
+     ⚠️ よって「右回し＝閉じる」は**開き方しだいで変わる**:
+
+       - `center` / `left` … 布は左端（円弧の始まり＝左下）から時計回りに伸びる
+                             → 右回しで**閉じる**
+       - `right`          … 布は右端（円弧の終わり＝右下）から**反時計回りに**伸びる
+                             → 右回しで**開く**
+
+     ⚠️ **円弧の向きは動かせない**——布は実際にその側に溜まるので、塗る側を偽れない。
+     動かせるのはノブの向きだけなので、こちらを合わせる。
+     （2026-08-11 ゆの: 「右開きの場合、アークの挙動とダイヤルの挙動を揃えてください」） */
+  const bool right_opening = (this->slots_[this->app_slot_].opening == CoverOpening::RIGHT);
+  float delta = (in == Input::ROTATE_CW) ? -COVER_POSITION_STEP : COVER_POSITION_STEP;
+  if (right_opening) {
+    delta = -delta;
+  }
   if (!this->cover_app_.position.step(delta)) {
     /* ⚠️ **位置を知らないうちは動かさない。** 恣意的な起点から動かすと、
        「少し開けたい」が「全開」になりうる。 */
