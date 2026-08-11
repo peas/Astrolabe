@@ -16,7 +16,7 @@ substitutions:
 packages:
   astrolabe:
     url: https://github.com/Khronos31/Astrolabe
-    ref: v0.2.0
+    ref: v0.2.1
     file: packages/m5dial.yaml
     # Pinned to a tag, so there is nothing to re-fetch. Keep `never`.
     refresh: never
@@ -89,6 +89,6 @@ astrolabe_ui:
 #
 #     astrolabe_diagnostics:
 #       url: https://github.com/Khronos31/Astrolabe
-#       ref: v0.2.0
+#       ref: v0.2.1
 #       file: packages/diagnostics.yaml
 #       refresh: never
