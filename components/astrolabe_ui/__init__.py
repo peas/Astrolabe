@@ -78,6 +78,14 @@ DEFAULT_ICONS = {
     SLOT_TYPE_GENERIC: "mdi:gesture-tap-button",
 }
 
+# ── cover の見た目 ────────────────────────────────────────────────────
+CONF_OPENING = "opening"
+
+#: ⚠️ **布がどちら側から伸びるか。** 画面の円弧は `ARC_START`(135°)＝左下、
+#:    終端(45°)＝右下なので、そのまま左右に対応する。
+#: ⚠️ C++ 側 `CoverOpening` と名前で対応させる。
+COVER_OPENINGS = {"center": 0, "left": 1, "right": 2}
+
 # ── generic のジェスチャ ────────────────────────────────────────────────
 CONF_TAP = "tap"
 CONF_HOLD = "hold"
@@ -257,7 +265,16 @@ SLOT_SCHEMA = cv.typed_schema(
     {
         SLOT_TYPE_LIGHT: _entity_slot(SLOT_TYPE_LIGHT),
         SLOT_TYPE_CLIMATE: _entity_slot(SLOT_TYPE_CLIMATE),
-        SLOT_TYPE_COVER: _entity_slot(SLOT_TYPE_COVER),
+        SLOT_TYPE_COVER: _entity_slot(
+            SLOT_TYPE_COVER,
+            {
+                # ⚠️ **見た目だけの設定。** 操作の意味は変わらない。
+                #    既定が `center` なのは、両開きが一番多く、左右非対称にならないため。
+                cv.Optional(CONF_OPENING, default="center"): cv.one_of(
+                    *COVER_OPENINGS, lower=True
+                ),
+            },
+        ),
         SLOT_TYPE_MEDIA: _entity_slot(SLOT_TYPE_MEDIA),
         SLOT_TYPE_GENERIC: GENERIC_SCHEMA,
     },
@@ -391,6 +408,8 @@ async def to_code(config):
                 arr,
             )
         )
+        if slot[CONF_TYPE] == SLOT_TYPE_COVER:
+            cg.add(var.set_cover_opening(index, COVER_OPENINGS[slot[CONF_OPENING]]))
         # ⚠️ **サービス名はここで解決して渡す。** C++側に表を持たせない——
         #    表がPython側にあれば、**押せない組み合わせはビルドで落ちる**。
         for gesture, gesture_id in GESTURES.items():

@@ -62,6 +62,14 @@ void AstrolabeUI::add_gesture(int slot, uint8_t gesture, const std::string &serv
   target.entity_id = entity_id;
 }
 
+void AstrolabeUI::set_cover_opening(int slot, uint8_t opening) {
+  if (slot < 0 || slot >= static_cast<int>(this->slots_.size())) {
+    ESP_LOGE(TAG, "cover opening for slot %d has nowhere to go", slot);
+    return;
+  }
+  this->slots_[slot].opening = static_cast<CoverOpening>(opening);
+}
+
 void AstrolabeUI::setup() {
   /* 電源保持を最初に立てる。 */
   gpio_reset_pin(PIN_PWR_HOLDING);
@@ -1221,6 +1229,7 @@ void AstrolabeUI::ui_task_() {
           view.state = static_cast<uint8_t>(this->cover_app_.state);
           view.can_set_position = (feat & COVER_FEAT_SET_POSITION) != 0;
           view.can_stop = (feat & COVER_FEAT_STOP) != 0;
+          view.opening = static_cast<CoverOpeningView>(this->slots_[this->app_slot_].opening);
           render_cover(this->canvas_, view);
           this->canvas_->pushSprite(0, 0);
           break;

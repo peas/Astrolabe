@@ -56,6 +56,9 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
    * ⚠️ `add_slot` の**あと**に呼ばれる（codegenがその順で出す）。 */
   void add_gesture(int slot, uint8_t gesture, const std::string &service, const std::string &entity_id);
 
+  /** `cover` の布がどちら側から伸びるか。⚠️ **見た目だけ。** */
+  void set_cover_opening(int slot, uint8_t opening);
+
   void setup() override;
   void loop() override;
   void dump_config() override;
@@ -236,6 +239,10 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
     std::string entity_id;
   };
 
+  /** 布がどちら側から伸びるか。⚠️ **見た目だけ**——操作の意味は変わらない。
+   * ⚠️ Python側 `COVER_OPENINGS` と一緒に増やす。 */
+  enum class CoverOpening : uint8_t { CENTER = 0, LEFT = 1, RIGHT = 2 };
+
   /** 調光画面のモード。⚠️ **長押しで行き来する。** */
   enum class LightMode : uint8_t { DIMMER, COLOR_TEMP };
 
@@ -247,6 +254,8 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
     int y;
     /** ⚠️ `generic` 以外では全部空のまま。 */
     GestureTarget gestures[static_cast<int>(Gesture::COUNT)];
+    /** ⚠️ `cover` のときだけ意味がある。 */
+    CoverOpening opening;
   };
 
   /** `generic` の画面の直後の状態。
@@ -258,6 +267,7 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
    * タップのつもりが長押しになる（閾値500ms）。 */
   /** カーテンの状態。⚠️ ライトの ON/OFF とは別の語彙なので、混ぜない。 */
   enum class CoverState : uint8_t { UNKNOWN, OPEN, CLOSED, OPENING, CLOSING };
+
 
   /** ⚠️ **Home Assistant の `supported_features` のビット**（`cover/const.py`）。
    * 持っていない機能は**断る**——0.1.1の色温度と同じ作法。 */

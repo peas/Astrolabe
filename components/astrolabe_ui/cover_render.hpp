@@ -30,10 +30,18 @@ static constexpr uint32_t COVER_TEXT_COLOR = 0xC09060;
 static constexpr uint32_t COVER_DIM_COLOR = 0x4A3A28;
 static constexpr uint32_t COVER_HINT_COLOR = 0x222222;
 
+/** 布がどちら側から伸びるか。⚠️ **見た目だけ。**
+ * 画面の円弧は `COVER_ARC_START`(135°)＝**左下**、終端(45°)＝**右下**なので、
+ * そのまま左右に対応する。 */
+enum class CoverOpeningView : uint8_t { CENTER = 0, LEFT = 1, RIGHT = 2 };
+
 /** カーテンに出すもの。⚠️ **描画は状態を持たない**——毎回これを渡し切る。 */
 struct CoverView {
-  /** 0-100。⚠️ **`-1` ＝ 位置を知らない。** */
+  /** ⚠️ **Home Assistant の言う「開いている割合」**（100 = 全開）。`-1` ＝ 知らない。
+   * ⚠️ **塗るのはこの値ではない。** 塗るのは布のある側＝ `100 - position`。 */
   int position;
+  /** 布がどちら側から伸びるか。 */
+  CoverOpeningView opening;
   /** 0=不明 / 1=開 / 2=閉 / 3=開いている最中 / 4=閉じている最中 */
   uint8_t state;
   /** ⚠️ 位置指定ができるか。できないならノブの案内を出さない。 */
@@ -53,12 +61,34 @@ inline void render_cover(LGFX_Sprite *canvas, const CoverView &v) {
   canvas->setTextSize(1.0f);
 
   if (v.position >= 0) {
-    if (v.position > 0) {
-      const float angle = COVER_ARC_START + (v.position / 100.0f) * COVER_ARC_SWEEP;
+    /* ⚠️ **塗るのは「布のある側」。** Home Assistant の `current_position` は
+       **開いている割合**（100 = 全開）なので、そのまま塗ると
+       **全開のときに一番塗られる**——布は無いのに。閉じているほど塗る。 */
+    const float closed = (100 - v.position) / 100.0f;
+    if (closed > 0.0f) {
       /* ⚠️ **動いている間は明るくする。** カーテンは指示してから実際に動き終わるまで
          数秒かかるので、**指示が通ったのか止まっているのか**が分からないと不安になる。 */
-      canvas->fillArc(COVER_CX, COVER_CY, COVER_R_OUT, COVER_R_IN, COVER_ARC_START, angle,
-                      moving ? COVER_MOVING_COLOR : COVER_FILL_COLOR);
+      const uint32_t col = moving ? COVER_MOVING_COLOR : COVER_FILL_COLOR;
+      const float end = COVER_ARC_START + COVER_ARC_SWEEP;
+      switch (v.opening) {
+        case CoverOpeningView::LEFT:
+          /* 左に開く＝布は左に溜まる＝**左端から右へ伸びる**。 */
+          canvas->fillArc(COVER_CX, COVER_CY, COVER_R_OUT, COVER_R_IN, COVER_ARC_START,
+                          COVER_ARC_START + closed * COVER_ARC_SWEEP, col);
+          break;
+        case CoverOpeningView::RIGHT:
+          canvas->fillArc(COVER_CX, COVER_CY, COVER_R_OUT, COVER_R_IN,
+                          end - closed * COVER_ARC_SWEEP, end, col);
+          break;
+        case CoverOpeningView::CENTER:
+        default:
+          /* 両開き＝布が**中央で合わさる**。両端から中央へ、それぞれ半分ずつ受け持つ。 */
+          canvas->fillArc(COVER_CX, COVER_CY, COVER_R_OUT, COVER_R_IN, COVER_ARC_START,
+                          COVER_ARC_START + closed * COVER_ARC_SWEEP / 2.0f, col);
+          canvas->fillArc(COVER_CX, COVER_CY, COVER_R_OUT, COVER_R_IN,
+                          end - closed * COVER_ARC_SWEEP / 2.0f, end, col);
+          break;
+      }
     }
     char pct[8];
     snprintf(pct, sizeof(pct), "%d%%", v.position);
