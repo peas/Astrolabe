@@ -397,8 +397,10 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
   void on_ha_color_modes_(std::string entity_id, std::string value);
   void on_ha_cover_position_(std::string entity_id, std::string value);
   void on_ha_cover_features_(std::string entity_id, std::string value);
-  /** entity_id からスロット番号。見つからなければ `-1`。 */
-  int slot_index_(const std::string &entity_id) const;
+  /** ⚠️ **同じ entity を複数のスロットに書ける**ので、一致した**全部**へ配る。
+   * 最初の一致で打ち切ると、2つ目以降へ状態が永久に届かない
+   * （同じカーテンを開き方違いで並べて見比べる、という使い方は普通にある）。 */
+  template<typename F> void for_each_slot_(const std::string &entity_id, F fn);
   /** スロット `slot` で**いま**色温度をいじれるか。いじれるなら範囲も返す。
    * ⚠️ **毎回 atomic から読む**（アプリを開いたときの写しを使わない）——
    * 開いている最中に電球が替わっても追随できるようにするため。 */

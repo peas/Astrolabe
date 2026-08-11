@@ -223,7 +223,7 @@ void AstrolabeUI::on_ha_state_(std::string entity_id, std::string state) {
       }
       this->cover_state_[i].store(static_cast<uint8_t>(cs));
       ESP_LOGD(TAG, "%s -> %s", entity_id.c_str(), state.c_str());
-      return;
+      continue;
     }
     SlotState v;
     if (state == "on") {
@@ -237,7 +237,6 @@ void AstrolabeUI::on_ha_state_(std::string entity_id, std::string state) {
     }
     this->states_[i].store(static_cast<uint8_t>(v));
     ESP_LOGD(TAG, "%s -> %s", entity_id.c_str(), state.c_str());
-    return;
   }
 }
 
@@ -259,17 +258,22 @@ void AstrolabeUI::on_ha_brightness_(std::string entity_id, std::string value) {
     }
     this->brightness_[i].store(static_cast<int16_t>(v));
     ESP_LOGD(TAG, "%s.brightness -> %ld", entity_id.c_str(), v);
-    return;
   }
 }
 
-int AstrolabeUI::slot_index_(const std::string &entity_id) const {
+/** ⚠️ **同じ entity を複数のスロットに書ける。**
+ *
+ * 最初の一致で打ち切ると、2つ目以降のスロットへ**状態が永久に届かない**——
+ * 画面には出るのに値が来ない、という一番分かりにくい壊れ方になる
+ * （同じカーテンを開き方違いで並べて見比べたい、という使い方は普通にある）。
+ * だから**一致した全部へ配る**。
+ */
+template<typename F> void AstrolabeUI::for_each_slot_(const std::string &entity_id, F fn) {
   for (size_t i = 0; i < this->slots_.size(); i++) {
     if (this->slots_[i].entity_id == entity_id) {
-      return static_cast<int>(i);
+      fn(static_cast<int>(i));
     }
   }
-  return -1;
 }
 
 /** 属性の素の値をケルビンとして読む。
@@ -312,88 +316,74 @@ static void ct_view_(int32_t raw, int lo, int hi, int *display, bool *known) {
 }
 
 void AstrolabeUI::on_ha_color_temp_(std::string entity_id, std::string value) {
-  const int i = this->slot_index_(entity_id);
-  if (i < 0) {
-    return;
-  }
   const int32_t k = parse_kelvin_(value);
-  this->color_temp_[i].store(k);
-  if (k < 0) {
-    ESP_LOGW(TAG, "%s.color_temp_kelvin: '%s' is not a number; treating as absent",
-             entity_id.c_str(), value.c_str());
-    return;
+  this->for_each_slot_(entity_id, [&](int i) { this->color_temp_[i].store(k); });
+  {
+    if (k < 0) {
+      ESP_LOGW(TAG, "%s.color_temp_kelvin: '%s' is not a number; treating as absent",
+               entity_id.c_str(), value.c_str());
+      return;
+    }
+    /* ⚠️ 範囲に収まっているかはここで見ない（範囲が遅れて届くため）。使う側で分ける。 */
+    ESP_LOGD(TAG, "%s.color_temp_kelvin -> %d", entity_id.c_str(), static_cast<int>(k));
   }
-  /* ⚠️ 範囲に収まっているかはここで見ない（範囲が遅れて届くため）。使う側で分ける。 */
-  ESP_LOGD(TAG, "%s.color_temp_kelvin -> %d", entity_id.c_str(), static_cast<int>(k));
 }
 
 void AstrolabeUI::on_ha_ct_min_(std::string entity_id, std::string value) {
-  const int i = this->slot_index_(entity_id);
-  if (i < 0) {
-    return;
-  }
-  this->ct_min_[i].store(parse_kelvin_(value));
+  const int32_t k = parse_kelvin_(value);
+  this->for_each_slot_(entity_id, [&](int i) { this->ct_min_[i].store(k); });
   ESP_LOGD(TAG, "%s.min_color_temp_kelvin -> %s", entity_id.c_str(), value.c_str());
 }
 
 void AstrolabeUI::on_ha_ct_max_(std::string entity_id, std::string value) {
-  const int i = this->slot_index_(entity_id);
-  if (i < 0) {
-    return;
-  }
-  this->ct_max_[i].store(parse_kelvin_(value));
+  const int32_t k = parse_kelvin_(value);
+  this->for_each_slot_(entity_id, [&](int i) { this->ct_max_[i].store(k); });
   ESP_LOGD(TAG, "%s.max_color_temp_kelvin -> %s", entity_id.c_str(), value.c_str());
 }
 
 void AstrolabeUI::on_ha_color_modes_(std::string entity_id, std::string value) {
-  const int i = this->slot_index_(entity_id);
-  if (i < 0) {
-    return;
-  }
   /* ⚠️ 値は Python の repr の文字列。**JSONではないので解析しない。**
      実機で観測した形は `[<ColorMode.COLOR_TEMP: 'color_temp'>]` で、
      素朴な `['color_temp']` ではない（enum が repr のまま文字列化されている）。
      色モードの語彙に `color_temp` を含む別の値は無いので、部分一致で足りる——
      **形が変わっても、名前が入っている限り効く**というのがここを解析しない理由。 */
   const bool capable = value.find("color_temp") != std::string::npos;
-  if (this->ct_capable_[i].exchange(capable) != capable) {
-    ESP_LOGI(TAG, "%s: color temp %s (%s)", entity_id.c_str(), capable ? "available" : "gone",
-             value.c_str());
-  }
+  this->for_each_slot_(entity_id, [&](int i) {
+    if (this->ct_capable_[i].exchange(capable) != capable) {
+      ESP_LOGI(TAG, "%s: color temp %s (%s)", entity_id.c_str(), capable ? "available" : "gone",
+               value.c_str());
+    }
+  });
 }
 
 void AstrolabeUI::on_ha_cover_position_(std::string entity_id, std::string value) {
-  const int i = this->slot_index_(entity_id);
-  if (i < 0) {
-    return;
-  }
   float v = 0.0f;
-  if (!parse_number(value, &v)) {
-    /* ⚠️ **位置を持たないカーテンもある**（開閉だけの機器）。その場合ここへは来ないが、
-       `None` が来ることはある。**0に倒さない。** */
-    this->cover_position_[i].store(-1);
+  /* ⚠️ **位置を持たないカーテンもある**（開閉だけの機器）。その場合ここへは来ないが、
+     `None` が来ることはある。**0に倒さない。** */
+  const bool ok = parse_number(value, &v);
+  if (!ok) {
     ESP_LOGW(TAG, "%s.current_position: '%s' is not a number; treating as absent", entity_id.c_str(),
              value.c_str());
-    return;
+  } else {
+    ESP_LOGD(TAG, "%s.current_position -> %d", entity_id.c_str(), static_cast<int>(v));
   }
-  this->cover_position_[i].store(static_cast<int16_t>(v));
-  ESP_LOGD(TAG, "%s.current_position -> %d", entity_id.c_str(), static_cast<int>(v));
+  this->for_each_slot_(entity_id, [&](int i) {
+    this->cover_position_[i].store(ok ? static_cast<int16_t>(v) : -1);
+  });
 }
 
 void AstrolabeUI::on_ha_cover_features_(std::string entity_id, std::string value) {
-  const int i = this->slot_index_(entity_id);
-  if (i < 0) {
-    return;
-  }
   float v = 0.0f;
   if (!parse_number(value, &v)) {
     return;
   }
   const uint32_t bits = static_cast<uint32_t>(v);
-  if (this->cover_features_[i].exchange(bits) != bits) {
-    ESP_LOGI(TAG, "%s: cover features %u (position=%s stop=%s)", entity_id.c_str(), bits,
-             (bits & COVER_FEAT_SET_POSITION) ? "yes" : "no", (bits & COVER_FEAT_STOP) ? "yes" : "no");
-  }
+  this->for_each_slot_(entity_id, [&](int i) {
+    if (this->cover_features_[i].exchange(bits) != bits) {
+      ESP_LOGI(TAG, "%s: cover features %u (position=%s stop=%s)", entity_id.c_str(), bits,
+               (bits & COVER_FEAT_SET_POSITION) ? "yes" : "no", (bits & COVER_FEAT_STOP) ? "yes" : "no");
+    }
+  });
 }
 
 bool AstrolabeUI::light_ct_available_(int slot, int *min_k, int *max_k) const {
