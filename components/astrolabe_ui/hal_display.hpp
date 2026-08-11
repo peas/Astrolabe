@@ -12,7 +12,13 @@
 // #include <M5GFX.h>
 // #include <lgfx/v1/panel/Panel_ST7789.hpp>
 
+/* ⚠️ **すでに定義されていることがある。** ESPHomeが引く LovyanGFX は
+   ビルドフラグで同じものを立てるので、無条件に define すると
+   `"LGFX_USE_V1" redefined` の警告が毎回出る（受け入れ条件 R1 は警告ゼロ）。
+   ⚠️ **消してはいけない**——素の LovyanGFX を単体で使う構成では、これが要る。 */
+#ifndef LGFX_USE_V1
 #define LGFX_USE_V1
+#endif
 #include <LovyanGFX.hpp>
 
 
