@@ -12,8 +12,21 @@ on:
 
 jobs:
   build:
-    name: Build the example
+    name: Build the example (ESPHome ${{ matrix.esphome }})
     runs-on: ubuntu-latest
+    strategy:
+      # Both legs run to completion. Which one broke is the whole question:
+      # latest going red means ESPHome moved, floor going red means the
+      # version this repository tells people is enough no longer is.
+      fail-fast: false
+      matrix:
+        # Two versions, because readers arrive with two different ones.
+        # `latest` is what the ESPHome Device Builder add-on runs. `floor` is
+        # min_version, which until now was only ever declared, never built —
+        # anyone building inside an environment that ships its own ESPHome
+        # (the Studio Code Server add-on, for one) rather than tracking the
+        # latest release was relying on an unchecked promise.
+        esphome: [latest, floor]
     steps:
       # Bumped from v4 in 2026-08: Node 20 is deprecated and these were being
       # forced onto Node 24 with a warning on every run.
@@ -21,17 +34,36 @@ jobs:
 
       - uses: actions/setup-python@v7
         with:
+          # One version that satisfies both legs: ESPHome 2025.11.0 requires
+          # <3.14 and 2026.7.x requires >=3.12. If the floor ever moves past
+          # what this Python can install, that shows up here as a red build
+          # rather than as a wrong claim in the README.
           python-version: "3.13"
 
       - name: Install ESPHome
-        run: pip install esphome
+        # latest is deliberately not pinned. The point of the weekly run is to
+        # find out when a new ESPHome release breaks this, so a red build there
+        # means something real. Whether it still *works on hardware* is a
+        # separate claim that only a person with an M5Dial can make; the README
+        # says so in its own words and is not checked here.
+        #
+        # floor reads the version out of the package instead of repeating it.
+        # README.md and packages/m5dial.yaml already state the floor twice and
+        # a step below checks they agree; writing it here as well would add a
+        # third copy to drift.
+        run: |
+          if [ "${{ matrix.esphome }}" = latest ]; then
+            pip install esphome
+          else
+            version=$(sed -n 's/^ *min_version: *\([0-9][0-9.]*\).*/\1/p' packages/m5dial.yaml)
+            if [ -z "$version" ]; then
+              echo "no min_version found in packages/m5dial.yaml" >&2
+              exit 1
+            fi
+            pip install "esphome==$version"
+          fi
 
       - name: Record the ESPHome version
-        # Deliberately not pinned. The point of the weekly run is to find out
-        # when a new ESPHome release breaks this, so a red build here means
-        # something real. Whether it still *works on hardware* is a separate
-        # claim that only a person with an M5Dial can make; the README says so
-        # in its own words and is not checked here.
         run: esphome version
 
       - name: Build the example exactly as published
@@ -77,7 +109,11 @@ jobs:
           esphome config astrolabe.yaml
           esphome compile astrolabe.yaml
 
+      # The three steps below do not touch ESPHome, so they run on one leg only.
+      # Running them per-version would double the noise without doubling what
+      # is checked.
       - name: Run the host tests
+        if: matrix.esphome == 'latest'
         # HaRange decides whether a number from Home Assistant may be shown and
         # whether it may be sent back. It has no hardware in it, so it can be
         # tested here — which matters, because the cases that make it necessary
@@ -88,6 +124,7 @@ jobs:
           /tmp/test_ha_value
 
       - name: Check that README still prints the example verbatim
+        if: matrix.esphome == 'latest'
         # If these drift, the YAML people copy is not the YAML that was built.
         run: |
           python - <<'PY'
@@ -103,7 +140,10 @@ jobs:
           PY
 
       - name: Check that the README's stated minimum matches the package
+        if: matrix.esphome == 'latest'
         # Two places state the floor. If they drift, one of them is lying.
+        # The floor leg above builds against whichever version this finds, so
+        # the two of them together are what turns the claim into a checked one.
         run: |
           python - <<'PY'
           import pathlib, re, sys

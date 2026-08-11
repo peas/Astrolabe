@@ -30,13 +30,16 @@ machine.
 
 Three different claims, which are worth keeping apart.
 
-**It will not build on anything older than 2025.11.0.** `min_version` enforces
-that.
+**It builds on 2025.11.0, and will not build on anything older.** `min_version`
+enforces the refusal, and CI builds the example against that version as well as
+the current one, so the floor is checked rather than asserted. This is the claim
+to care about if you build inside something that ships its own ESPHome and does
+not track the latest release.
 
 **It builds on the current ESPHome.** There is no way to declare an upper bound,
 so a future release could break this. CI builds the example against whatever
-ESPHome is current, on every push and once a week; the badge above is that
-result, and a red badge means a release has broken something.
+ESPHome is current, on every push and once a week. The badge above covers this
+and the floor build alike, so a red badge means one of the two has broken.
 
 **It was last run on hardware with ESPHome 2026.7.4.** Only somebody holding an
 M5Dial can make that claim, so it is not checked by CI and it will go stale. If
