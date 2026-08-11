@@ -1377,10 +1377,19 @@ void AstrolabeUI::on_touch_short_(uint32_t now) {
         return;
       }
       if (this->app_slot_ >= 0 && this->slots_[this->app_slot_].type == SlotType::CLIMATE) {
-        /* ⚠️ **どの画面でもタップはON/OFF**（2026-08-11 11:46 ゆの）——
-           **非対応のモードを指している間も効く**。
-           ⚠️ 電源の入切は「いま何モードを見ているか」と無関係な操作なので、
-           モードの都合で塞ぐと**消したいのに消せない**ことが起きる。 */
+        if (this->climate_on_unsupported_mode_()) {
+          /* ⚠️ **非対応のモードを指している間は、タップも受け付けない**
+             （2026-08-11 11:56 ゆの。11:46の「どの画面でも効かせる」から**差し戻し**）。
+             ⚠️ **無音**——画面が「使えない」と言っているのに音だけ返すと、
+             効いたのか効かなかったのかが分からなくなる。
+             ⚠️ 閉じ込めにはならない: **長押しで対応モードへ抜けられる**し、
+             **クリック（ノブ押下）は通る**——どちらもここでは塞いでいない。 */
+          this->last_activity_ms_ = now;
+          ESP_LOGD(TAG, "climate: mode not supported; tap ignored (silent)");
+          return;
+        }
+        /* ⚠️ **`climate.toggle` を呼ぶ。** `light.toggle` を流用しない——
+           ドメインが違えば**無言で失敗する**（実際にその不具合を踏んだ）。 */
         this->last_activity_ms_ = now;
         this->beep_(BEEP_HZ_ACTION);
         Action a{};
