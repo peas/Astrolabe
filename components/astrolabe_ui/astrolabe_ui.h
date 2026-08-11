@@ -60,9 +60,12 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
   void set_cover_opening(int slot, uint8_t opening);
   /** `climate` の運転モードを1つ、YAMLに書かれた順で足す。⚠️ **`setup()` より前に呼ばれる。** */
   void add_climate_mode(int slot, uint8_t mode);
-  /** 操作リングのアイコン。⚠️ **1組だけ**（全 `media_player` スロットで共有）。
-   * @param index `MediaAction` の値。⚠️ Python側 `MEDIA_RING_ICONS` と並びで対応 */
-  void add_media_ring_icon(int index, const uint16_t *icon);
+  /** 操作リングのアイコンと**その位置**。⚠️ **1組だけ**（全 `media_player` スロットで共有）。
+   * @param index `MediaAction` の値。⚠️ Python側 `MEDIA_RING_ICONS` と並びで対応
+   * @param x,y ⚠️ **`ring.py` が計算した項目座標**（`SELECTOR_TRACK_RADIUS`=60 の軌道）。
+   *        **ここで再計算しない**——描画側が `(RING_RADIUS*2)/120` 倍するので、
+   *        アイコンの半径(95)を渡すと**画面の外に出る**（実際に踏んだ）。 */
+  void add_media_ring_icon(int index, const uint16_t *icon, int x, int y);
 
   void setup() override;
   void loop() override;
@@ -614,6 +617,8 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
   std::atomic<bool> media_state_seen_[SLOTS_MAX];
   /** 操作リングのアイコン。⚠️ **フラッシュ常駐・所有しない。** `nullptr` ＝ 焼かれていない。 */
   const uint16_t *media_ring_icons_[static_cast<int>(MediaAction::COUNT)]{};
+  /** 操作リングの項目座標。⚠️ **`ring.py` が計算したものをそのまま持つ。** */
+  int media_ring_xy_[static_cast<int>(MediaAction::COUNT)][2]{};
 
   /* タッチ計器の写し。**描画タスクが書き、メインループが読む。**
    * ⚠️ 生の値はタッチドライバの中にあるが、そこは描画タスクの持ち物なので直接読ませない。 */

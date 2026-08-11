@@ -83,12 +83,14 @@ void AstrolabeUI::add_climate_mode(int slot, uint8_t mode) {
   this->slots_[slot].modes.push_back(mode);
 }
 
-void AstrolabeUI::add_media_ring_icon(int index, const uint16_t *icon) {
+void AstrolabeUI::add_media_ring_icon(int index, const uint16_t *icon, int x, int y) {
   if (index < 0 || index >= static_cast<int>(MediaAction::COUNT)) {
     ESP_LOGE(TAG, "media ring icon %d is out of range", index);
     return;
   }
   this->media_ring_icons_[index] = icon;
+  this->media_ring_xy_[index][0] = x;
+  this->media_ring_xy_[index][1] = y;
 }
 
 void AstrolabeUI::setup() {
@@ -227,16 +229,13 @@ void AstrolabeUI::setup() {
     mcfg.animTime_x = 300;
     mcfg.animTime_y = 300;
     this->media_menu_->getSelector()->config(mcfg);
-    /* ⚠️ **座標は `ring.py` の `slot_positions(4)` と同じ式**（12時から時計回り）。
-       上＝再生/一時停止 / 右＝次 / 下＝停止 / 左＝前。
-       ⚠️ ここだけC++で計算しているのは、**4点固定でYAMLに現れない**ため
-       （スロットの座標はPython側が持つ、という取り決めの対象外）。 */
+    /* ⚠️ **座標は codegen（`ring.py`）が計算済み。ここで再計算しない。**
+       一度C++で計算して `SELECTOR_TRACK_RADIUS`(60) と `ICON_RING_RADIUS`(95) を
+       取り違え、**アイコンが画面の外(150px)に出た**（2026-08-11）。
+       スロットと同じ規則で 12時から時計回り＝上/右/下/左。 */
     static const char *const kTags[] = {"PLAY", "NEXT", "STOP", "PREV"};
     for (int i = 0; i < static_cast<int>(MediaAction::COUNT); i++) {
-      const float ang = 2.0f * 3.14159265f * i / static_cast<float>(MediaAction::COUNT) - 3.14159265f / 2.0f;
-      const int x = 120 + static_cast<int>(RING_RADIUS * cosf(ang));
-      const int y = 120 + static_cast<int>(RING_RADIUS * sinf(ang));
-      this->media_menu_->getMenu()->addItem("", x, y, 22, 22);
+      this->media_menu_->getMenu()->addItem("", this->media_ring_xy_[i][0], this->media_ring_xy_[i][1], 22, 22);
       RenderSlot rs;
       rs.tag_up = kTags[i];
       rs.icon = this->media_ring_icons_[i];

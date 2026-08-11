@@ -517,9 +517,15 @@ async def to_code(config):
     # ⚠️ **操作リングのアイコンは1組だけ焼く。** スロットごとに焼くと同じ絵が重複する。
     #    ⚠️ `media_player` スロットが1つも無ければ**焼かない**——使わない14KBを載せない。
     if any(sl[CONF_TYPE] == SLOT_TYPE_MEDIA for sl in config[CONF_SLOTS]):
+        # ⚠️ **スロットの並びと同じ関数を使う**（12時から時計回り）。
+        ring_positions = ring.slot_positions(len(MEDIA_RING_ICONS))
         for i, name in enumerate(MEDIA_RING_ICONS):
             pixels = icons.render_icon(
                 name, icons.DEFAULT_ICON_BG, icons.DEFAULT_ICON_FG
             )
             arr = cg.progmem_array(config[f"{CONF_MEDIA_RING_IDS}_{i}"], pixels)
-            cg.add(var.add_media_ring_icon(i, arr))
+            # ⚠️ **座標もここで計算して渡す。** C++側で再計算しない——
+            #    一度やって `SELECTOR_TRACK_RADIUS`(60) と `ICON_RING_RADIUS`(95) を
+            #    取り違え、**アイコンが画面の外に出た**（2026-08-11）。
+            x, y = ring_positions[i]
+            cg.add(var.add_media_ring_icon(i, arr, x, y))
