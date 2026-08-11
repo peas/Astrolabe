@@ -4,15 +4,17 @@
 
 Turn an [M5Dial](https://docs.m5stack.com/en/core/M5Dial) into a physical
 Home Assistant controller: a ring of icons you turn through with the knob,
-tap to open, and turn again to dim.
+tap to open, and turn again to change whatever that slot controls — brightness,
+a target temperature, how far a curtain is drawn, a volume.
 
 Astrolabe is an ESPHome [external component](https://esphome.io/components/external_components.html).
 Your slots are declared in YAML and compiled into the firmware, so the device
 draws its whole face before it has talked to anything, and there is no custom
 Home Assistant integration to install.
 
-**This release handles `light` entities.** Other domains are planned; see
-[Scope](#scope).
+**This release handles `light`, `climate`, `cover`, `media_player` and
+`generic` slots.** What each one does with the knob, a tap and a long press is
+in [Slots](#slots); what it deliberately leaves out is in [Scope](#scope).
 
 ## Requirements
 
