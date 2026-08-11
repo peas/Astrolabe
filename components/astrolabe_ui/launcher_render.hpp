@@ -45,6 +45,10 @@ struct RenderSlot {
   std::string tag_down;
   /** 42x42 RGB565（**バイト入れ替え済み**）。フラッシュ常駐・**所有しない**。 */
   const uint16_t *icon{nullptr};
+  /** ⚠️ **いまそれが選べるか。** false なら暗く描く。
+   * ランチャーのスロットは常に true——**メディアの操作リング**が使う。
+   * ⚠️ 「持っていない」ではなく「**いまは無い**」を表す（能力は状態で変わる）。 */
+  bool enabled{true};
 };
 
 class LauncherRender : public SMOOTH_MENU::SimpleMenuCallback_t {
@@ -75,7 +79,7 @@ class LauncherRender : public SMOOTH_MENU::SimpleMenuCallback_t {
       const int y = (menuItemList[i]->y - 120) * icon_r / 120 + 120;
 
       const bool selected = (i == static_cast<int>(selector.targetItem));
-      this->draw_slot_(x, y, (*slots_)[i].icon, selected);
+      this->draw_slot_(x, y, (*slots_)[i].icon, selected, (*slots_)[i].enabled);
     }
 
     /* 中央のタグ。 */
@@ -113,7 +117,15 @@ class LauncherRender : public SMOOTH_MENU::SimpleMenuCallback_t {
    * ⚠️ **ランチャーは状態を表示しない。** 出るのはアイコンだけで、
    * 点いているかどうかはアプリを開いた先で見る。
    * **ここに輪を描き足さないこと**——一度やって「変な枠」になった。 */
-  void draw_slot_(int x, int y, const uint16_t *icon, bool selected) {
+  void draw_slot_(int x, int y, const uint16_t *icon, bool selected, bool enabled = true) {
+    if (!enabled) {
+      /* ⚠️ **いま選べないものは、絵を出さずに輪郭だけ残す。**
+         絵を薄く重ねる手もあるが、`pushImage` に減光の引数が無く、
+         **アイコンごとに減光した配列を焼く**ことになる——アセットが倍になる。
+         ⚠️ 「そこに何かがある」と「いまは使えない」の両方が伝わればよい。 */
+      canvas_->fillSmoothCircle(x, y, ICON_DIAMETER / 2.0f, SLOT_NO_ICON_COLOR);
+      return;
+    }
     if (icon == nullptr) {
       /* 焼き込みが無いとき（本来来ない）。**黙って何も描かない、をしない。** */
       canvas_->fillSmoothCircle(x, y, ICON_DIAMETER / 2.0f, SLOT_NO_ICON_COLOR);

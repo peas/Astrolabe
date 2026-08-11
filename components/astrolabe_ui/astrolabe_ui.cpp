@@ -11,6 +11,7 @@
 #include "cover_render.hpp"
 #include "generic_render.hpp"
 #include "light_render.hpp"
+#include "media_render.hpp"
 
 namespace esphome {
 namespace astrolabe_ui {
@@ -82,6 +83,14 @@ void AstrolabeUI::add_climate_mode(int slot, uint8_t mode) {
   this->slots_[slot].modes.push_back(mode);
 }
 
+void AstrolabeUI::add_media_ring_icon(int index, const uint16_t *icon) {
+  if (index < 0 || index >= static_cast<int>(MediaAction::COUNT)) {
+    ESP_LOGE(TAG, "media ring icon %d is out of range", index);
+    return;
+  }
+  this->media_ring_icons_[index] = icon;
+}
+
 void AstrolabeUI::setup() {
   /* 電源保持を最初に立てる。 */
   gpio_reset_pin(PIN_PWR_HOLDING);
@@ -125,6 +134,19 @@ void AstrolabeUI::setup() {
   }
   for (auto &c : this->climate_modes_) {
     c.store(0);
+  }
+  /* ⚠️ **音量は NaN が「無い」。** 0.0 は「消音」という正当な値なので番兵にできない。 */
+  for (auto &c : this->media_volume_) {
+    c.store(NAN);
+  }
+  for (auto &c : this->media_features_) {
+    c.store(0);
+  }
+  for (auto &c : this->media_playing_) {
+    c.store(false);
+  }
+  for (auto &c : this->media_state_seen_) {
+    c.store(false);
   }
   for (auto &c : this->ct_capable_) {
     /* ⚠️ **既定は「対応していない」。** 届く前と非対応を同じ扱いにする——
@@ -181,6 +203,48 @@ void AstrolabeUI::setup() {
   }
   this->menu_->getSelector()->goToItem(0);
 
+  /* ⚠️ **操作リングは専用のメニューを持つ。** ランチャーの `menu_` を作り替えない——
+     `clearAllItem()` は要素を `delete` せずリストを捨てるので、**開くたびに漏れる**。
+     ⚠️ `media_player` スロットが1つも無ければ作らない（アイコンも焼かれていない）。 */
+  bool has_media = false;
+  for (auto &s2 : this->slots_) {
+    if (s2.type == SlotType::MEDIA_PLAYER) {
+      has_media = true;
+      break;
+    }
+  }
+  if (has_media) {
+    this->media_menu_ = new SMOOTH_MENU::Simple_Menu;  // NOLINT
+    this->media_render_ = new LauncherRender;          // NOLINT
+    this->media_render_->set_canvas(this->canvas_);
+    this->media_render_->set_slots(&this->media_ring_slots_);
+    this->media_menu_->init(240, 240);
+    this->media_menu_->setRenderCallback(this->media_render_);
+    this->media_menu_->setMenuLoopMode(true);
+    auto mcfg = this->media_menu_->getSelector()->config();
+    mcfg.animPath_x = LVGL::overshoot;
+    mcfg.animPath_y = LVGL::overshoot;
+    mcfg.animTime_x = 300;
+    mcfg.animTime_y = 300;
+    this->media_menu_->getSelector()->config(mcfg);
+    /* ⚠️ **座標は `ring.py` の `slot_positions(4)` と同じ式**（12時から時計回り）。
+       上＝再生/一時停止 / 右＝次 / 下＝停止 / 左＝前。
+       ⚠️ ここだけC++で計算しているのは、**4点固定でYAMLに現れない**ため
+       （スロットの座標はPython側が持つ、という取り決めの対象外）。 */
+    static const char *const kTags[] = {"PLAY", "NEXT", "STOP", "PREV"};
+    for (int i = 0; i < static_cast<int>(MediaAction::COUNT); i++) {
+      const float ang = 2.0f * 3.14159265f * i / static_cast<float>(MediaAction::COUNT) - 3.14159265f / 2.0f;
+      const int x = 120 + static_cast<int>(RING_RADIUS * cosf(ang));
+      const int y = 120 + static_cast<int>(RING_RADIUS * sinf(ang));
+      this->media_menu_->getMenu()->addItem("", x, y, 22, 22);
+      RenderSlot rs;
+      rs.tag_up = kTags[i];
+      rs.icon = this->media_ring_icons_[i];
+      this->media_ring_slots_.push_back(rs);
+    }
+    this->media_menu_->getSelector()->goToItem(0);
+  }
+
   /* ⚠️ 要素の型を取り違えないこと。**行き先が違えば型も違う**——
      `action_queue_` は Home Assistant を呼ぶ意図、`input_queue_` は生の入力。 */
   this->action_queue_ = xQueueCreate(8, sizeof(Action));
@@ -221,6 +285,12 @@ void AstrolabeUI::setup() {
       /* ⚠️ **対応モードは実行時にしか分からない。** ビルド時にHAへ問い合わせる経路が無い。 */
       this->subscribe_homeassistant_state(&AstrolabeUI::on_ha_climate_modes_, s.entity_id, "hvac_modes");
       ESP_LOGCONFIG(TAG, "  subscribe %s: temp, range, step, modes (6)", s.entity_id.c_str());
+    } else if (s.type == SlotType::MEDIA_PLAYER) {
+      this->subscribe_homeassistant_state(&AstrolabeUI::on_ha_media_volume_, s.entity_id, "volume_level");
+      /* ⚠️ **能力は機器でも状態でも変わる**（実測: spotify は idle で 2048、再生中は 444983）。
+         **届くたび作り直す**——起動時に読んで焼き付けると嘘をつく。 */
+      this->subscribe_homeassistant_state(&AstrolabeUI::on_ha_media_features_, s.entity_id, "supported_features");
+      ESP_LOGCONFIG(TAG, "  subscribe %s: volume, features", s.entity_id.c_str());
     } else if (s.type == SlotType::COVER) {
       this->subscribe_homeassistant_state(&AstrolabeUI::on_ha_cover_position_, s.entity_id, "current_position");
       /* ⚠️ **できることのビット。** 位置指定を持たない機器でノブを効かせないため。 */
@@ -281,10 +351,39 @@ static uint8_t hvac_mode_from_(const std::string &value) {
   return HVAC_UNKNOWN;
 }
 
+void AstrolabeUI::on_ha_media_volume_(std::string entity_id, std::string value) {
+  float v = NAN;
+  const bool ok = parse_number(value, &v);
+  /* ⚠️ **範囲外は捨てる。** HAは0.0-1.0で報告する約束だが、外れた値を通すと
+     `HaRange` の「範囲内なら送ってよい」が意味を失う。 */
+  this->for_each_slot_(entity_id, [&](int i) {
+    this->media_volume_[i].store((ok && v >= 0.0f && v <= 1.0f) ? v : NAN);
+  });
+}
+
+void AstrolabeUI::on_ha_media_features_(std::string entity_id, std::string value) {
+  float v = 0.0f;
+  const uint32_t bits = parse_number(value, &v) ? static_cast<uint32_t>(v) : 0;
+  this->for_each_slot_(entity_id, [&](int i) {
+    if (this->media_features_[i].exchange(bits) != bits) {
+      /* ⚠️ **変わったことをログに出す。** 「さっきは押せたのに」の原因がここにある。 */
+      ESP_LOGI(TAG, "%s: media features %u", entity_id.c_str(), bits);
+    }
+  });
+}
+
 void AstrolabeUI::on_ha_state_(std::string entity_id, std::string state) {
   /* ⚠️ **メインループ（core 0）から呼ばれる。** ここで触ってよいのは atomic だけ。 */
   for (size_t i = 0; i < this->slots_.size(); i++) {
     if (this->slots_[i].entity_id != entity_id) {
+      continue;
+    }
+    if (this->slots_[i].type == SlotType::MEDIA_PLAYER) {
+      /* ⚠️ **メディアの語彙は ON/OFF ではない**（`playing` / `paused` / `idle` / `off` /
+         `buffering` / `standby`）。ライトの解釈に混ぜない。
+         ⚠️ ここで要るのは「鳴っているか」だけ——タップが `pause` か `play` かを決める。 */
+      this->media_playing_[i].store(state == "playing" || state == "buffering");
+      this->media_state_seen_[i].store(state != "unavailable" && state != "unknown");
       continue;
     }
     if (this->slots_[i].type == SlotType::CLIMATE) {
@@ -620,6 +719,18 @@ void AstrolabeUI::loop() {
                                          {{"entity_id", entity}});
         break;
 
+      case ActionKind::SET_VOLUME:
+        ESP_LOGD(TAG, "set %s volume=%.2f", entity.c_str(), static_cast<double>(action.volume));
+        this->call_homeassistant_service("media_player.volume_set",
+                                         {{"entity_id", entity}, {"volume_level", to_string(action.volume)}});
+        break;
+
+      case ActionKind::MEDIA_ACTION:
+        ESP_LOGD(TAG, "media_player.%s %s", action.media_service, entity.c_str());
+        this->call_homeassistant_service(std::string("media_player.") + action.media_service,
+                                         {{"entity_id", entity}});
+        break;
+
       case ActionKind::SET_CLIMATE_TEMP:
         ESP_LOGD(TAG, "set %s temperature=%.1f", entity.c_str(), static_cast<double>(action.temperature));
         this->call_homeassistant_service("climate.set_temperature",
@@ -758,9 +869,21 @@ bool AstrolabeUI::open_app_(int index, uint32_t now) {
       return true;
     }
 
-    case SlotType::MEDIA_PLAYER:
-      /* ⚠️ **まだ画面が無い。** 黙って開いて何も出さないより、開かない方がよい。 */
-      break;
+    case SlotType::MEDIA_PLAYER: {
+      if (this->media_menu_ == nullptr) {
+        break;
+      }
+      this->media_app_ = MediaAppState{};
+      /* ⚠️ **開くときは必ず音量から。** 操作リングは長押しで行く場所
+         （`light` が必ず明るさから開くのと同じ）。 */
+      this->media_app_.page = MediaPage::VOLUME;
+      this->media_sync_(index);
+      this->app_slot_ = index;
+      this->set_screen_(Screen::APP);
+      this->last_activity_ms_ = now;
+      ESP_LOGI(TAG, "open app: slot %d (media)", index);
+      return true;
+    }
   }
   /* ⚠️ 未対応の種別は**黙って落とさない**。開けなかったと言い、ランチャーに留まる。 */
   ESP_LOGW(TAG, "open_app: slot %d has no app for its type yet", index);
@@ -829,6 +952,15 @@ void AstrolabeUI::on_touch_long_(uint32_t now) {
   }
   if (this->app_slot_ >= 0 && this->slots_[this->app_slot_].type == SlotType::GENERIC) {
     this->fire_gesture_(Gesture::HOLD, now);
+    return;
+  }
+  if (this->app_slot_ >= 0 && this->slots_[this->app_slot_].type == SlotType::MEDIA_PLAYER) {
+    /* ⚠️ **長押しはページ送りだけ。何も送らない**（`light` の DIM⇔CLR と同じ位置づけ）。 */
+    this->media_app_.page =
+        (this->media_app_.page == MediaPage::VOLUME) ? MediaPage::RING : MediaPage::VOLUME;
+    this->last_activity_ms_ = now;
+    this->beep_(BEEP_HZ_MODE, BEEP_MS_MODE);
+    ESP_LOGI(TAG, "media: page -> %s", this->media_app_.page == MediaPage::VOLUME ? "volume" : "ring");
     return;
   }
   if (this->app_slot_ >= 0 && this->slots_[this->app_slot_].type == SlotType::CLIMATE) {
@@ -924,6 +1056,146 @@ void AstrolabeUI::fire_gesture_(Gesture g, uint32_t now) {
   this->generic_app_.fired = g;
   this->generic_app_.offline = !(online && queued);
   this->generic_app_.at_ms = now;
+}
+
+void AstrolabeUI::media_sync_(int slot) {
+  /* ⚠️ **範囲は 0.0-1.0 で固定。** 音量は割合なので機器ごとに違わない
+     （温度や色温度と違うところ。カーテンの位置と同じ）。 */
+  this->media_app_.volume.set_bounds(0.0f, 1.0f);
+  const float v = this->media_volume_[slot].load();
+  if (std::isnan(v)) {
+    /* ⚠️ 届いていない。**0% と混ぜない**——0.0 は「消音」という正当な値。 */
+    this->media_app_.volume.clear_reported();
+  } else {
+    this->media_app_.volume.set_reported(v);
+  }
+  this->media_app_.is_playing = this->media_playing_[slot].load();
+  this->media_app_.state_received = this->media_state_seen_[slot].load();
+}
+
+bool AstrolabeUI::media_action_available_(int slot, MediaAction a) const {
+  const uint32_t f = this->media_features_[slot].load();
+  switch (a) {
+    case MediaAction::PLAY_PAUSE:
+      /* ⚠️ **鳴っているなら止められるか、止まっているなら鳴らせるか。**
+         `PAUSE` と `PLAY` は別のビットで、**片方しか持たない機器がある**。 */
+      return this->media_playing_[slot].load() ? (f & MEDIA_FEAT_PAUSE) != 0 : (f & MEDIA_FEAT_PLAY) != 0;
+    case MediaAction::NEXT:
+      return (f & MEDIA_FEAT_NEXT) != 0;
+    case MediaAction::STOP:
+      return (f & MEDIA_FEAT_STOP) != 0;
+    case MediaAction::PREVIOUS:
+      return (f & MEDIA_FEAT_PREVIOUS) != 0;
+    default:
+      return false;
+  }
+}
+
+void AstrolabeUI::media_app_input_(Input in, uint32_t now) {
+  if (in != Input::ROTATE_CW && in != Input::ROTATE_CCW) {
+    return;
+  }
+  if (this->media_app_.page == MediaPage::RING) {
+    /* ⚠️ **リングでは選択を動かすだけ。何も送らない。**
+       ここがこの画面の要——回している間に呼び出しが飛ばないので、
+       **勢いよく回して曲が大量に飛ぶ**（Y3）が構造的に起きない。 */
+    if (this->media_menu_ != nullptr) {
+      if (in == Input::ROTATE_CW) {
+        this->media_menu_->goNext();
+      } else {
+        this->media_menu_->goLast();
+      }
+    }
+    this->last_activity_ms_ = now;
+    return;
+  }
+
+  if (!(this->media_features_[this->app_slot_].load() & MEDIA_FEAT_VOLUME_SET)) {
+    /* ⚠️ **音量を持たない機器・状態ではノブを効かせない。** 動かない目盛りを見せない。 */
+    ESP_LOGD(TAG, "media: no volume_set; knob refused");
+    return;
+  }
+  this->media_app_.volume.set_bounds(0.0f, 1.0f);
+  if (!this->media_app_.volume.step((in == Input::ROTATE_CW) ? MEDIA_VOLUME_STEP : -MEDIA_VOLUME_STEP)) {
+    /* ⚠️ **値を知らないうちは動かさない**（Y1）。夜の枕元で1目盛り＝50%を起こさない。 */
+    ESP_LOGD(TAG, "media: volume unknown; knob does nothing");
+    return;
+  }
+  this->media_app_.last_local_change_ms = now;
+  this->media_app_.publish_pending = true;
+  ESP_LOGD(TAG, "media: volume=%.2f", static_cast<double>(this->media_app_.volume.value()));
+}
+
+void AstrolabeUI::media_fire_(uint32_t now) {
+  const int sel = (this->media_menu_ != nullptr)
+                      ? static_cast<int>(this->media_menu_->getSelector()->getTargetItem())
+                      : 0;
+  if (sel < 0 || sel >= static_cast<int>(MediaAction::COUNT)) {
+    return;
+  }
+  const auto a = static_cast<MediaAction>(sel);
+  if (!this->media_action_available_(this->app_slot_, a)) {
+    /* ⚠️ **無音で断る。** アイコンを暗く描いてあるので、鳴らすと嘘になる。 */
+    ESP_LOGD(TAG, "media: action %d not available", sel);
+    return;
+  }
+  /* ⚠️ **サービス名はフラッシュ常駐の文字列リテラル**（キューに `std::string` を載せない）。 */
+  const char *svc = nullptr;
+  switch (a) {
+    case MediaAction::PLAY_PAUSE:
+      /* ⚠️ **`media_play_pause` を使わない。** 持っているとは限らないうえ、
+         こちらは再生中かを知っているので、**確実な方を名指しで呼ぶ**。 */
+      svc = this->media_app_.is_playing ? "media_pause" : "media_play";
+      break;
+    case MediaAction::NEXT:
+      svc = "media_next_track";
+      break;
+    case MediaAction::STOP:
+      svc = "media_stop";
+      break;
+    case MediaAction::PREVIOUS:
+      svc = "media_previous_track";
+      break;
+    default:
+      return;
+  }
+  Action act{};
+  act.kind = ActionKind::MEDIA_ACTION;
+  act.slot = static_cast<uint8_t>(this->app_slot_);
+  act.media_service = svc;
+  if (xQueueSend(this->action_queue_, &act, 0) != pdTRUE) {
+    this->dropped_actions_.fetch_add(1);
+    ESP_LOGW(TAG, "media action dropped: action queue full");
+    return;
+  }
+  this->last_activity_ms_ = now;
+  this->beep_(BEEP_HZ_ACTION);
+  ESP_LOGI(TAG, "media: %s", svc);
+}
+
+void AstrolabeUI::media_app_publish_(uint32_t now) {
+  if (!this->media_app_.publish_pending) {
+    return;
+  }
+  /* ⚠️ **間引きは `light` と同じ120ms。** カーテンだけが「静定してから最終値」。 */
+  if (now - this->media_app_.last_publish_ms < PUBLISH_INTERVAL_MS) {
+    return;
+  }
+  float vol = 0.0f;
+  if (!this->media_app_.volume.to_send(&vol)) {
+    this->media_app_.publish_pending = false;
+    return;
+  }
+  this->media_app_.last_publish_ms = now;
+  this->media_app_.publish_pending = false;
+  Action a{};
+  a.kind = ActionKind::SET_VOLUME;
+  a.slot = static_cast<uint8_t>(this->app_slot_);
+  a.volume = vol;
+  if (xQueueSend(this->action_queue_, &a, 0) != pdTRUE) {
+    this->dropped_actions_.fetch_add(1);
+    ESP_LOGW(TAG, "media volume dropped: action queue full");
+  }
 }
 
 void AstrolabeUI::climate_sync_(int slot) {
@@ -1236,7 +1508,7 @@ void AstrolabeUI::app_input_(Input in, uint32_t now) {
       this->climate_app_input_(in, now);
       return;
     case SlotType::MEDIA_PLAYER:
-      /* まだ実装していない。⚠️ **開けないので、ここへは来ない**（`open_app_` が断る）。 */
+      this->media_app_input_(in, now);
       return;
   }
 }
@@ -1393,6 +1665,33 @@ void AstrolabeUI::on_touch_short_(uint32_t now) {
            古い目標値が画面に出続ける。 */
         this->cover_app_.position.set_chosen(closing ? 0.0f : 100.0f);
         this->cover_app_.publish_pending = false;
+        return;
+      }
+      if (this->app_slot_ >= 0 && this->slots_[this->app_slot_].type == SlotType::MEDIA_PLAYER) {
+        if (this->media_app_.page == MediaPage::RING) {
+          /* ⚠️ **リングでは、選ばれているものを実行する。** ここが唯一の送信点。 */
+          this->media_fire_(now);
+          return;
+        }
+        /* 音量ページのタップは再生/一時停止。
+           ⚠️ **できないときは無音で断る**——画面にも案内を出していない。 */
+        if (!this->media_action_available_(this->app_slot_, MediaAction::PLAY_PAUSE)) {
+          this->last_activity_ms_ = now;
+          ESP_LOGD(TAG, "media: play/pause not available; tap ignored (silent)");
+          return;
+        }
+        Action a{};
+        a.kind = ActionKind::MEDIA_ACTION;
+        a.slot = static_cast<uint8_t>(this->app_slot_);
+        a.media_service = this->media_app_.is_playing ? "media_pause" : "media_play";
+        if (xQueueSend(this->action_queue_, &a, 0) != pdTRUE) {
+          this->dropped_actions_.fetch_add(1);
+          ESP_LOGW(TAG, "media action dropped: action queue full");
+          return;
+        }
+        this->last_activity_ms_ = now;
+        this->beep_(BEEP_HZ_ACTION);
+        ESP_LOGI(TAG, "media: %s", a.media_service);
         return;
       }
       if (this->app_slot_ >= 0 && this->slots_[this->app_slot_].type == SlotType::CLIMATE) {
@@ -1620,6 +1919,52 @@ void AstrolabeUI::ui_task_() {
             view.has_rotate = !slot.gestures[static_cast<int>(Gesture::ROTATE_RIGHT)].service.empty() ||
                               !slot.gestures[static_cast<int>(Gesture::ROTATE_LEFT)].service.empty();
             render_generic(this->canvas_, view);
+          }
+          this->canvas_->pushSprite(0, 0);
+          break;
+        }
+
+        if (this->app_slot_ >= 0 && this->slots_[this->app_slot_].type == SlotType::MEDIA_PLAYER) {
+          if (now - this->last_activity_ms_ >= IDLE_TIMEOUT_MS) {
+            /* ⚠️ **戻る前に、溜まっている音量を出し切る。** */
+            this->media_app_.last_publish_ms = 0;
+            this->media_app_publish_(now);
+            ESP_LOGI(TAG, "app -> clock (idle)");
+            this->set_screen_(Screen::CLOCK);
+            this->app_slot_ = -1;
+            this->last_clock_render_ms_ = now - CLOCK_RENDER_MS;
+            break;
+          }
+
+          /* HAからのこだま。⚠️ **回している直後は無視する**——ノブと綱引きになる。 */
+          if (now - this->media_app_.last_local_change_ms >= LOCAL_CHANGE_GUARD_MS) {
+            this->media_sync_(this->app_slot_);
+          } else {
+            /* 音量は触らないが、⚠️ **再生状態は常に取り込む**——
+               タップの意味（pause か play か）が変わるので、遅れさせない。 */
+            this->media_app_.is_playing = this->media_playing_[this->app_slot_].load();
+            this->media_app_.state_received = this->media_state_seen_[this->app_slot_].load();
+          }
+          this->media_app_publish_(now);
+
+          if (this->media_app_.page == MediaPage::RING) {
+            /* ⚠️ **できないものを暗くする。** 能力は機器でも状態でも変わるので**毎フレーム**見る
+               （表を焼き込むと、アイドルで全部暗いはずの画面が明るいままになる）。 */
+            for (int i = 0; i < static_cast<int>(this->media_ring_slots_.size()); i++) {
+              this->media_ring_slots_[i].enabled =
+                  this->media_action_available_(this->app_slot_, static_cast<MediaAction>(i));
+            }
+            /* ⚠️ `update()` はアニメーションを進めるので毎周期呼ぶ。描画もこの中。 */
+            this->media_menu_->update(now);
+          } else {
+            MediaView view{};
+            view.volume = this->media_app_.volume.usable() ? this->media_app_.volume.value() : NAN;
+            view.is_playing = this->media_app_.is_playing;
+            view.state_received = this->media_app_.state_received;
+            view.can_set_volume =
+                (this->media_features_[this->app_slot_].load() & MEDIA_FEAT_VOLUME_SET) != 0;
+            view.can_play_pause = this->media_action_available_(this->app_slot_, MediaAction::PLAY_PAUSE);
+            render_media(this->canvas_, view);
           }
           this->canvas_->pushSprite(0, 0);
           break;

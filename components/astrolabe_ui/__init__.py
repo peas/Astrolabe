@@ -86,6 +86,20 @@ CONF_OPENING = "opening"
 #: ⚠️ C++ 側 `CoverOpening` と名前で対応させる。
 COVER_OPENINGS = {"center": 0, "left": 1, "right": 2}
 
+# ── media_player の操作リング ──────────────────────────────────────────
+#: ⚠️ **リング上の位置＝並び順**（`ring.py` の `slot_positions(4)` は12時から時計回り）。
+#:    上＝再生/一時停止 / 右＝次 / 下＝停止 / 左＝前。
+#:    **次が右・前が左**で空間の感覚と一致する（2026-08-11 ゆの）。
+#: ⚠️ **C++ 側 `MediaAction` と並びで対応させる**（ここだけは順番に意味がある）。
+MEDIA_RING_ICONS = [
+    "mdi:play-pause",
+    "mdi:skip-next",
+    "mdi:stop",
+    "mdi:skip-previous",
+]
+#: 焼き込む画素配列のID。⚠️ **1組を全スロットで共有する**（スロットごとに焼かない）。
+CONF_MEDIA_RING_IDS = "media_ring_ids"
+
 # ── climate の運転モード ────────────────────────────────────────────────
 CONF_MODES = "modes"
 
@@ -390,6 +404,12 @@ CONFIG_SCHEMA = cv.All(
             #    ⚠️ **音量や音程は出さない**——音の設計は製品の一部で、
             #      変えたい場合は `packages/` を自分のリポジトリへ写して使う。
             cv.Optional(CONF_SOUND, default=True): cv.boolean,
+            # 操作リングのアイコンを焼くID。⚠️ **利用者は書かない。**
+            #    ⚠️ `media_player` スロットが1つも無ければ焼かない（下の `to_code`）。
+            cv.GenerateID(f"{CONF_MEDIA_RING_IDS}_0"): cv.declare_id(cg.uint16),
+            cv.GenerateID(f"{CONF_MEDIA_RING_IDS}_1"): cv.declare_id(cg.uint16),
+            cv.GenerateID(f"{CONF_MEDIA_RING_IDS}_2"): cv.declare_id(cg.uint16),
+            cv.GenerateID(f"{CONF_MEDIA_RING_IDS}_3"): cv.declare_id(cg.uint16),
             # ブザーの出力先。⚠️ **package が埋めるので利用者は書かない。**
             #    音程を入力の種類ごとに変えるので `LEDCOutput`（素の `output` では
             #    実行時に周波数を変えられない）。
@@ -493,3 +513,13 @@ async def to_code(config):
                         index, gesture_id, gesture_service(slot[gesture]), slot[gesture]
                     )
                 )
+
+    # ⚠️ **操作リングのアイコンは1組だけ焼く。** スロットごとに焼くと同じ絵が重複する。
+    #    ⚠️ `media_player` スロットが1つも無ければ**焼かない**——使わない14KBを載せない。
+    if any(sl[CONF_TYPE] == SLOT_TYPE_MEDIA for sl in config[CONF_SLOTS]):
+        for i, name in enumerate(MEDIA_RING_ICONS):
+            pixels = icons.render_icon(
+                name, icons.DEFAULT_ICON_BG, icons.DEFAULT_ICON_FG
+            )
+            arr = cg.progmem_array(config[f"{CONF_MEDIA_RING_IDS}_{i}"], pixels)
+            cg.add(var.add_media_ring_icon(i, arr))

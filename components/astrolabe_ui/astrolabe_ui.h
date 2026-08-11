@@ -60,6 +60,9 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
   void set_cover_opening(int slot, uint8_t opening);
   /** `climate` の運転モードを1つ、YAMLに書かれた順で足す。⚠️ **`setup()` より前に呼ばれる。** */
   void add_climate_mode(int slot, uint8_t mode);
+  /** 操作リングのアイコン。⚠️ **1組だけ**（全 `media_player` スロットで共有）。
+   * @param index `MediaAction` の値。⚠️ Python側 `MEDIA_RING_ICONS` と並びで対応 */
+  void add_media_ring_icon(int index, const uint16_t *icon);
 
   void setup() override;
   void loop() override;
@@ -145,6 +148,9 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
    * 範囲は個体ごとに違うので Home Assistant に従うが、刻みの粗さは好みの問題で、
    * 「同じ製品の別の個体で当然に違うもの」ではない。 */
   static constexpr int COLOR_TEMP_STEP = 200;
+  /** 音量の1目盛り。⚠️ **範囲は 0.0-1.0 固定**なので、刻みも固定でよい
+   * （温度と違い、機器ごとに違う量ではない）。 */
+  static constexpr float MEDIA_VOLUME_STEP = 0.02f;
   /** 設定温度の1目盛り。⚠️ **`target_temp_step` が届かなかったときだけ**使う（Y4）。
    * 実機には 1 の機器と 0.5 の機器の両方があった——固定にすると必ずどちらかと喧嘩する。 */
   static constexpr float CLIMATE_TEMP_STEP_DEFAULT = 0.5f;
@@ -222,6 +228,8 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
     SET_COVER_POSITION,
     SET_CLIMATE_TEMP,
     SET_HVAC_MODE,
+    SET_VOLUME,
+    MEDIA_ACTION,
   };
 
   struct Action {
@@ -248,6 +256,11 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
     float temperature;
     /** `SET_HVAC_MODE` のときの `HvacMode`。 */
     uint8_t hvac_mode;
+    /** `SET_VOLUME` のときの 0.0-1.0。 */
+    float volume;
+    /** `MEDIA_ACTION` のときのサービス名。⚠️ **キューに文字列は載せられない**ので、
+     * `media_player.` に続く部分を指す**フラッシュ常駐のポインタ**を渡す（所有しない）。 */
+    const char *media_service;
     bool is_on;
   };
 
@@ -281,6 +294,38 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
 
   /** 調光画面のモード。⚠️ **長押しで行き来する。** */
   enum class LightMode : uint8_t { DIMMER, COLOR_TEMP };
+
+  /** 操作リングの並び。⚠️ **リング上の位置そのもの**——`ring.py` の `slot_positions(4)` は
+   * 12時から時計回りなので、**上 / 右 / 下 / 左**。
+   * ⚠️ **次が右・前が左**で空間の感覚と一致する（2026-08-11 ゆの）。
+   * ⚠️ Python側 `MEDIA_RING_ICONS` と**並びで**対応させる。 */
+  enum class MediaAction : uint8_t { PLAY_PAUSE = 0, NEXT = 1, STOP = 2, PREVIOUS = 3, COUNT = 4 };
+
+  /** メディアの画面。⚠️ **長押しで行き来する**（`light` の DIM⇔CLR と同じ位置づけ）。 */
+  enum class MediaPage : uint8_t { VOLUME, RING };
+
+  /** ⚠️ Home Assistant の `MediaPlayerEntityFeature`。**一次情報から取っている**
+   * （`homeassistant/components/media_player/const.py`。2026-08-11 確認）。
+   * ⚠️ **状態で変わる**ので、届くたびに読み直す（表を焼き込まない）。 */
+  static constexpr uint32_t MEDIA_FEAT_PAUSE = 1;
+  static constexpr uint32_t MEDIA_FEAT_VOLUME_SET = 4;
+  static constexpr uint32_t MEDIA_FEAT_PREVIOUS = 16;
+  static constexpr uint32_t MEDIA_FEAT_NEXT = 32;
+  static constexpr uint32_t MEDIA_FEAT_STOP = 4096;
+  static constexpr uint32_t MEDIA_FEAT_PLAY = 16384;
+
+  /** メディア画面の編集中の値。⚠️ **描画タスクの持ち物。** */
+  struct MediaAppState {
+    /** 音量（0.0-1.0）。⚠️ **範囲つきの値**なので、未着なら回しても動かず、送りもしない。 */
+    HaRange volume;
+    MediaPage page;
+    /** 再生中か。⚠️ タップの意味（`media_pause` か `media_play` か）がこれで決まる。 */
+    bool is_playing;
+    bool state_received;
+    uint32_t last_local_change_ms;
+    uint32_t last_publish_ms;
+    bool publish_pending;
+  };
 
   struct SlotConfig {
     SlotType type;
@@ -450,6 +495,8 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
   /** ⚠️ 値は Python の repr。**部分一致で拾えない**——`heat` は `heat_cool` の部分文字列。
    * 引用符ごと突き合わせる。詳細は実装のコメント。 */
   void on_ha_climate_modes_(std::string entity_id, std::string value);
+  void on_ha_media_volume_(std::string entity_id, std::string value);
+  void on_ha_media_features_(std::string entity_id, std::string value);
   /** ⚠️ **同じ entity を複数のスロットに書ける**ので、一致した**全部**へ配る。
    * 最初の一致で打ち切ると、2つ目以降へ状態が永久に届かない
    * （同じカーテンを開き方違いで並べて見比べる、という使い方は普通にある）。 */
@@ -489,6 +536,15 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
    * 一致していればタップは「オフ」、していなければ「そのモードを送る」。 */
   bool climate_display_matches_running_() const;
   void climate_app_publish_(uint32_t now);
+  /** HAから届いている音量と再生状態を、メディア画面へ写す。
+   * ⚠️ `light_ct_sync_` と同じく、**回している最中に呼ばない**。 */
+  void media_sync_(int slot);
+  /** ⚠️ **いまその操作ができるか。** 能力は機器でも状態でも変わるので、**毎回読み直す**。 */
+  bool media_action_available_(int slot, MediaAction a) const;
+  void media_app_input_(Input in, uint32_t now);
+  /** リングで選ばれているものを実行する。⚠️ **できないものは無音で断る。** */
+  void media_fire_(uint32_t now);
+  void media_app_publish_(uint32_t now);
 
   LGFX_StampRing display_;
   /** ⚠️ **`display_` は描画タスクの持ち物**。`dump_config()`（メインループ）から
@@ -548,6 +604,17 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
    * ⚠️ **文字列をコアの境界を越えて渡さない**ため、購読側でビットに畳んでから置く。 */
   std::atomic<uint16_t> climate_modes_[SLOTS_MAX];
 
+  /* ── メディア ── */
+  /** 音量（0.0-1.0）。⚠️ **NaN ＝ 届いていない。** 0.0 は「消音」という正当な値。 */
+  std::atomic<float> media_volume_[SLOTS_MAX];
+  /** ⚠️ **できることのビット。** 機器でも状態でも変わるので、届くたび作り直す。 */
+  std::atomic<uint32_t> media_features_[SLOTS_MAX];
+  /** 再生中か。 */
+  std::atomic<bool> media_playing_[SLOTS_MAX];
+  std::atomic<bool> media_state_seen_[SLOTS_MAX];
+  /** 操作リングのアイコン。⚠️ **フラッシュ常駐・所有しない。** `nullptr` ＝ 焼かれていない。 */
+  const uint16_t *media_ring_icons_[static_cast<int>(MediaAction::COUNT)]{};
+
   /* タッチ計器の写し。**描画タスクが書き、メインループが読む。**
    * ⚠️ 生の値はタッチドライバの中にあるが、そこは描画タスクの持ち物なので直接読ませない。 */
   std::atomic<int16_t> g_ctrl_last_{-1};
@@ -590,6 +657,12 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
   GenericAppState generic_app_{};
   CoverAppState cover_app_{};
   ClimateAppState climate_app_{};
+  MediaAppState media_app_{};
+  /** ⚠️ **操作リング専用のメニュー。** ランチャーの `menu_` に触らない——
+   * `clearAllItem()` は要素を `delete` せずリストを捨てるので、作り替えると漏れる。 */
+  SMOOTH_MENU::Simple_Menu *media_menu_{nullptr};
+  LauncherRender *media_render_{nullptr};
+  std::vector<RenderSlot> media_ring_slots_;
 };
 
 }  // namespace astrolabe_ui
