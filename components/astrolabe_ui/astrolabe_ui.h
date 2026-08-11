@@ -301,22 +301,9 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
   struct LightAppState {
     int brightness;
     LightMode mode;
-    /** 画面に出す色温度（K）。範囲が分かっていれば**必ず範囲内に丸めてある**。
-     * `-1` ＝ **値そのものが無い**（属性が届いていない・`None` が来た）。 */
-    int color_temp;
-    /** ⚠️ **上の値を Home Assistant へ送り返してよいか。**
-     *
-     * 表示と送信を分けてある。**丸めた値は見せてよいが、送ってはいけない**——
-     * 丸めは「たぶんこの辺」という推測であって、利用者が選んだ値ではない。
-     *
-     * ⚠️ 実例: あるライトはトグルで点け直すたび `color_temp_kelvin: 65280` を報告する。
-     * 実物は最大色温度になっているので**丸めた表示は正しい**が、
-     * **65280 が常に「最大」を意味する保証はどこにもない**——それはその統合の癖であって、
-     * 別のライトで同じとは限らない。だから見せるだけにする。
-     *
-     * `true` になるのは、**利用者がノブを回したとき**と、
-     * **HAが範囲内の値を報告したとき**だけ。 */
-    bool color_temp_known;
+    /** 色温度（K）。⚠️ **範囲つきの値**なので、未着なら回しても動かず、送りもしない。
+     * 表示と送信を分ける理由（`65280` を報告するライトの話）は `ha_value.h` にある。 */
+    HaRange color_temp;
     bool is_on;
     bool state_received;
     uint32_t last_local_change_ms;
@@ -408,6 +395,10 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
    * ⚠️ **毎回 atomic から読む**（アプリを開いたときの写しを使わない）——
    * 開いている最中に電球が替わっても追随できるようにするため。 */
   bool light_ct_available_(int slot, int *min_k, int *max_k) const;
+  /** HAから届いている色温度（範囲と値）を、調光画面の `HaRange` へ写す。
+   * ⚠️ **`set_reported` は「利用者が選んだ」印を倒す**ので、
+   * 回している最中に呼ばないこと（呼び出し側で `LOCAL_CHANGE_GUARD_MS` を見る）。 */
+  void light_ct_sync_(int slot);
 
   LGFX_StampRing display_;
   /** ⚠️ **`display_` は描画タスクの持ち物**。`dump_config()`（メインループ）から
