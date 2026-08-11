@@ -16,7 +16,7 @@ substitutions:
 packages:
   astrolabe:
     url: https://github.com/Khronos31/Astrolabe
-    ref: v0.1.2
+    ref: v0.2.0
     file: packages/m5dial.yaml
     # Pinned to a tag, so there is nothing to re-fetch. Keep `never`.
     refresh: never
@@ -52,11 +52,34 @@ astrolabe_ui:
       tag_up: "LIVING"
       tag_down: "LIGHT"
       icon: mdi:lightbulb
-    - type: light
-      entity_id: light.bedroom
-      tag_up: "BED"
-      tag_down: "ROOM"
-      icon: mdi:bed
+
+    - type: climate
+      entity_id: climate.bedroom
+      tag_up: "AIR"
+      # Long press cycles this list; nothing is sent until you tap or turn.
+      # A mode your device does not have is shown greyed out, not sent, and
+      # not removed from the list — the mistake stays visible.
+      modes: [cool, heat]
+
+    - type: cover
+      entity_id: cover.living_curtain
+      tag_up: "CURTAIN"
+      # Which side the fabric gathers on: center, left or right. The knob
+      # follows the fabric, so this also decides which way to turn.
+      opening: center
+
+    - type: media_player
+      entity_id: media_player.living
+      tag_up: "MEDIA"
+
+    # A generic slot has no entity of its own; each gesture names one.
+    # Anything not listed does nothing and stays silent.
+    - type: generic
+      tag_up: "GOOD"
+      tag_down: "NIGHT"
+      icon: mdi:weather-night
+      tap: script.goodnight
+      hold: script.bedroom_off
 
 # ── Optional: diagnostics ──
 # Add one more entry under `packages:` to expose heap, loop time, touch health,
@@ -66,6 +89,6 @@ astrolabe_ui:
 #
 #     astrolabe_diagnostics:
 #       url: https://github.com/Khronos31/Astrolabe
-#       ref: v0.1.2
+#       ref: v0.2.0
 #       file: packages/diagnostics.yaml
 #       refresh: never

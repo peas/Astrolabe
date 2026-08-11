@@ -10,12 +10,12 @@
 #   packages:
 #     astrolabe:
 #       url: https://github.com/Khronos31/Astrolabe
-#       ref: v0.1.2
+#       ref: v0.2.0
 #       file: packages/m5dial.yaml
 #       refresh: never
 #     astrolabe_diagnostics:      # <- this
 #       url: https://github.com/Khronos31/Astrolabe
-#       ref: v0.1.2
+#       ref: v0.2.0
 #       file: packages/diagnostics.yaml
 #       refresh: never
 #

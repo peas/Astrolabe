@@ -15,9 +15,11 @@ jobs:
     name: Build the example
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      # Bumped from v4 in 2026-08: Node 20 is deprecated and these were being
+      # forced onto Node 24 with a warning on every run.
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.13"
 

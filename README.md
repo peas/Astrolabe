@@ -84,7 +84,7 @@ substitutions:
 packages:
   astrolabe:
     url: https://github.com/Khronos31/Astrolabe
-    ref: v0.1.2
+    ref: v0.2.0
     file: packages/m5dial.yaml
     # Pinned to a tag, so there is nothing to re-fetch. Keep `never`.
     refresh: never
@@ -120,11 +120,34 @@ astrolabe_ui:
       tag_up: "LIVING"
       tag_down: "LIGHT"
       icon: mdi:lightbulb
-    - type: light
-      entity_id: light.bedroom
-      tag_up: "BED"
-      tag_down: "ROOM"
-      icon: mdi:bed
+
+    - type: climate
+      entity_id: climate.bedroom
+      tag_up: "AIR"
+      # Long press cycles this list; nothing is sent until you tap or turn.
+      # A mode your device does not have is shown greyed out, not sent, and
+      # not removed from the list — the mistake stays visible.
+      modes: [cool, heat]
+
+    - type: cover
+      entity_id: cover.living_curtain
+      tag_up: "CURTAIN"
+      # Which side the fabric gathers on: center, left or right. The knob
+      # follows the fabric, so this also decides which way to turn.
+      opening: center
+
+    - type: media_player
+      entity_id: media_player.living
+      tag_up: "MEDIA"
+
+    # A generic slot has no entity of its own; each gesture names one.
+    # Anything not listed does nothing and stays silent.
+    - type: generic
+      tag_up: "GOOD"
+      tag_down: "NIGHT"
+      icon: mdi:weather-night
+      tap: script.goodnight
+      hold: script.bedroom_off
 
 # ── Optional: diagnostics ──
 # Add one more entry under `packages:` to expose heap, loop time, touch health,
@@ -134,7 +157,7 @@ astrolabe_ui:
 #
 #     astrolabe_diagnostics:
 #       url: https://github.com/Khronos31/Astrolabe
-#       ref: v0.1.2
+#       ref: v0.2.0
 #       file: packages/diagnostics.yaml
 #       refresh: never
 ```
@@ -208,12 +231,45 @@ the build rather than producing a face you cannot read.
 
 | Option | | |
 |---|---|---|
-| `type` | **required** | `light` |
-| `entity_id` | **required** | Must match `type` — a `light` slot needs a `light.` entity. |
+| `type` | **required** | `light`, `climate`, `cover`, `media_player` or `generic`. |
+| `entity_id` | **required** except `generic` | Must match `type` — a `light` slot needs a `light.` entity. |
 | `tag_up` | **required** | Upper line of the label shown in the middle. |
 | `tag_down` | `""` | Lower line. |
 | `icon` | per type | Any [Material Design Icons](https://pictogrammers.com/library/mdi/) name, as `mdi:name`. |
 | `icon_bg` / `icon_fg` | `#9E9E9E` / `#141414` | Icon colours, as `#RRGGBB`. |
+
+#### What each type does
+
+| Type | Knob | Tap | Long press |
+|---|---|---|---|
+| `light` | Brightness, or colour temperature | On/off | Switch the knob between the two |
+| `climate` | Target temperature | Send the mode shown, or turn off if it is already running | Show the next mode. **Nothing is sent** |
+| `cover` | Target position | Close if it is more than half open, otherwise open | Stop |
+| `media_player` | Volume, or the selection on the action ring | Play/pause, or run the selected action | Switch between volume and the ring |
+| `generic` | `rotate_right` / `rotate_left` | `tap` | `hold` |
+
+Anything the device cannot currently do is refused in silence and is not
+offered on screen. That is not the same as a device that is merely off: a
+media player exposes almost nothing while idle and gains it back when
+something is playing, so the ring dims and lights up as you use it.
+
+#### Extra options per type
+
+| Type | Option | | |
+|---|---|---|---|
+| `climate` | `modes` | `[]` | Modes to cycle with a long press, in order — any of `off`, `heat`, `cool`, `heat_cool`, `auto`, `dry`, `fan_only`. Leave it out and long press does nothing. |
+| `cover` | `opening` | `center` | Which side the fabric gathers on: `center`, `left` or `right`. |
+| `generic` | `tap` `hold` `rotate_right` `rotate_left` | — | An entity to act on. At least one is required. |
+
+`modes` lists what you want to reach, not what the device has. A mode it does
+not support is drawn greyed out and never sent — the list is not silently
+shortened, so a mistake stays visible instead of disappearing.
+
+A `generic` slot works out the right service from the entity's domain, because
+"press this" means different things: `script.turn_on` runs a script where
+`script.toggle` would stop one that is already running, and `automation.trigger`
+runs an automation where `automation.toggle` would enable or disable it.
+Domains where pressing has no clear meaning fail the build.
 
 Icons are rendered at build time from the Material Design Icons webfont,
 pinned to version 7.4.47 and fetched once, then cached. Any of the 7,447 icons
@@ -233,10 +289,19 @@ go looking.
 
 ## Scope
 
-This release does `light`, with brightness and colour temperature. The
-remaining domains from the device this grew out of — `climate`, `cover`,
-`media_player`, and a `generic` slot whose gestures call whatever entities you
-name — are planned.
+This release does `light`, `climate`, `cover`, `media_player` and `generic`.
+
+It deliberately does not show text that comes from Home Assistant — no track
+titles, no fan speed names. Rendering arbitrary text well would mean shipping a
+font, and a source-only project is a poor place to carry one. What is on screen
+instead is what the dial can state without help: a number, a position, a
+colour, an icon that is either lit or not.
+
+Nothing here reads a value the device has not reported. A knob does not move
+until Home Assistant has said what it is moving from, and a value outside the
+range the device itself gave is shown rounded to the edge but never sent back.
+The screen will sometimes say it does not know; that is the honest answer, and
+it is a different answer from zero.
 
 If you want to change something this does not expose — pin assignments, the
 idle timeout, the geometry of the ring, the sounds — copy
