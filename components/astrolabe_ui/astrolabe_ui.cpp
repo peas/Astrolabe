@@ -975,9 +975,11 @@ void AstrolabeUI::climate_cursor_sync_(int slot) {
   }
   /* ⚠️ **報告が `modes:` に無い**（書いていない `off` や `dry` で運転中など）。
      **並びの最後に置く**——長押しは `cursor+1` へ進むので、**1回目がちょうど先頭**になる。
-     ここを決めておかないと、カーソルが古いままで回し始めが読めなくなる。 */
+     ⚠️ **`cursor_synced` は立てない。** これは「カーソルの位置が、出して意味のあるものか」も
+     兼ねている——立てると `climate_display_mode_` が末尾を出してしまい、
+     **`off` のエアコンを開いた瞬間に `heat_cool` を指して UNSUPPORTED が出る**。
+     寄せられていない間は**並びの先頭を暗く出す**のが正しい見せ方（ゆの 2026-08-11）。 */
   this->climate_app_.cursor = static_cast<uint8_t>(modes.size() - 1);
-  this->climate_app_.cursor_synced = true;
 }
 
 bool AstrolabeUI::climate_mode_supported_(int slot, uint8_t mode) const {
@@ -990,15 +992,33 @@ bool AstrolabeUI::climate_mode_supported_(int slot, uint8_t mode) const {
   return (mask & static_cast<uint16_t>(1u << mode)) != 0;
 }
 
+bool AstrolabeUI::climate_display_mode_(int slot, uint8_t *out) const {
+  const auto &modes = this->slots_[slot].modes;
+  if (modes.empty()) {
+    return false;
+  }
+  /* ⚠️ **カーソルがまだ寄っていないときは、並びの先頭を指す。**
+     カーソル自体は「最後尾」に置いてある（長押し1回目が先頭に来るように）が、
+     **それをそのまま出すと、開いた瞬間に並びの末尾を指して見える**——
+     `off` のエアコンを開いたら `heat_cool` が出て UNSUPPORTED、という筋になっていた。
+     ⚠️ 参照実装は、消えているときも**選択中のモードを暗く出していた**。それに倣う。 */
+  const size_t i = this->climate_app_.cursor_synced ? this->climate_app_.cursor : 0;
+  if (i >= modes.size()) {
+    return false;
+  }
+  *out = modes[i];
+  return true;
+}
+
 bool AstrolabeUI::climate_on_unsupported_mode_() const {
   if (this->app_slot_ < 0 || this->slots_[this->app_slot_].type != SlotType::CLIMATE) {
     return false;
   }
-  const auto &modes = this->slots_[this->app_slot_].modes;
-  if (modes.empty() || this->climate_app_.cursor >= modes.size()) {
+  uint8_t mode = 0;
+  if (!this->climate_display_mode_(this->app_slot_, &mode)) {
     return false;
   }
-  return !this->climate_mode_supported_(this->app_slot_, modes[this->climate_app_.cursor]);
+  return !this->climate_mode_supported_(this->app_slot_, mode);
 }
 
 void AstrolabeUI::climate_app_input_(Input in, uint32_t now) {
@@ -1604,10 +1624,10 @@ void AstrolabeUI::ui_task_() {
           view.min_temp = this->climate_min_[this->app_slot_].load();
           view.max_temp = this->climate_max_[this->app_slot_].load();
           view.have_range = this->climate_app_.target.have_bounds();
-          if (!modes.empty()) {
-            const uint8_t m = modes[this->climate_app_.cursor];
-            view.mode_name = HVAC_MODE_NAMES[m];
-            view.mode_unsupported = !this->climate_mode_supported_(this->app_slot_, m);
+          uint8_t shown = 0;
+          if (this->climate_display_mode_(this->app_slot_, &shown)) {
+            view.mode_name = HVAC_MODE_NAMES[shown];
+            view.mode_unsupported = !this->climate_mode_supported_(this->app_slot_, shown);
           }
           const uint8_t rep = static_cast<uint8_t>(this->climate_app_.reported);
           view.state_received = (rep != static_cast<uint8_t>(HvacMode::UNKNOWN));

@@ -471,6 +471,11 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
   /** ⚠️ **機器がそのモードを持っているか。** 届く前は「持っている」と答える——
    * 起動直後に赤字を出さないため。 */
   bool climate_mode_supported_(int slot, uint8_t mode) const;
+  /** ⚠️ **画面が「指している」モード。** カーソルがまだHAの報告に寄っていないうちは、
+   * **並びの先頭**を指す——参照実装が、消えているときも選択中のモードを（暗く）出していた作法。
+   * ⚠️ **入力の可否も描画もこれを見る。** 二重に持つと片方だけ直して食い違う。
+   * @return `modes:` が空なら false */
+  bool climate_display_mode_(int slot, uint8_t *out) const;
   /** ⚠️ **いま画面が「機器の持たないモード」を指しているか。**
    * 指している間は**長押し以外を受け付けない**（2026-08-11 11:21 ゆの）。
    * ⚠️ ノブの**ボタン（戻る）だけは通す**——止めるとこの画面から出られなくなる。 */

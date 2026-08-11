@@ -98,7 +98,9 @@ inline void render_climate(LGFX_Sprite *canvas, const ClimateView &v) {
   const uint32_t col =
       v.mode_unsupported ? CLIMATE_GRAYED_COLOR : climate_mode_color(v.reported_name, v.is_on);
 
-  if (have_target && v.have_range && v.max_temp > v.min_temp) {
+  /* ⚠️ **消えているときは塗らない。** 参照実装がそうしていた——
+     止まっている機器で目盛りが伸びていると、動いているように見える。 */
+  if (v.is_on && have_target && v.have_range && v.max_temp > v.min_temp) {
     /* 設定温度の位置まで塗る。⚠️ **範囲は機器に従う**ので、目盛りは個体ごとに違う。 */
     float f = (v.target - v.min_temp) / (v.max_temp - v.min_temp);
     if (f < 0.0f) {
@@ -139,7 +141,9 @@ inline void render_climate(LGFX_Sprite *canvas, const ClimateView &v) {
   if (have_target) {
     /* ⚠️ **0.5刻みの機器があるので小数第1位まで出す。** 整数だけだと半目盛りが消える。 */
     snprintf(buf, sizeof(buf), "%.1f", static_cast<double>(v.target));
-    canvas->setTextColor(CLIMATE_TEXT_COLOR);
+    /* ⚠️ **消えているときは暗く。** 参照実装の作法（`is_on ? text_col : dim_col`）。
+       設定温度は残っているが、**いま効いてはいない**。 */
+    canvas->setTextColor(v.is_on ? CLIMATE_TEXT_COLOR : CLIMATE_DIM_COLOR);
   } else {
     /* ⚠️ **知らないときは円弧も数字も出さない。** 0℃ と混ぜない。 */
     snprintf(buf, sizeof(buf), "--.-");
@@ -160,7 +164,11 @@ inline void render_climate(LGFX_Sprite *canvas, const ClimateView &v) {
   canvas->setFont(&fonts::efontCN_24);
   canvas->setTextSize(0.75f);
   if (v.mode_name != nullptr) {
-    canvas->setTextColor(CLIMATE_TEXT_COLOR);
+    /* ⚠️ **消えているときは暗く出す。** ⚠️ **消えていても隠さない**——
+       `off` はモードではなく電源の状態なので、**選んでいるモードは出したまま**にする
+       （参照実装も、消えている間 COOL/HEAT の選択を暗く出し続けていた）。
+       2026-08-11 ゆの「並びの先頭を、オフで表示できませんか？」。 */
+    canvas->setTextColor(v.is_on ? CLIMATE_TEXT_COLOR : CLIMATE_DIM_COLOR);
     canvas->drawCenterString(v.mode_name, CLIMATE_CX, CLIMATE_CY + 22);
   } else if (v.state_received && v.reported_name != nullptr) {
     /* `modes:` が書かれていないときは、**HAの報告をそのまま見せる**（動かせないが、読める）。 */
@@ -173,6 +181,13 @@ inline void render_climate(LGFX_Sprite *canvas, const ClimateView &v) {
 
   canvas->setFont(&fonts::Font2);
   canvas->setTextSize(1.0f);
+  /* ⚠️ **電源の状態は言葉でも出す。** 色の濃淡だけだと、暗いのか消えているのかが
+     見分けにくい（参照実装も `ON` / `OFF` を文字で出していた）。
+     ⚠️ **届いていないときは言わない**——消えているとも点いているとも決めつけない。 */
+  if (v.state_received) {
+    canvas->setTextColor(v.is_on ? CLIMATE_TEXT_COLOR : CLIMATE_DIM_COLOR);
+    canvas->drawCenterString(v.is_on ? "ON" : "OFF", CLIMATE_CX, 176);
+  }
   canvas->setTextColor(CLIMATE_HINT_COLOR);
   /* ⚠️ **できることだけ案内する。** `modes:` が空なら長押しは効かないので書かない。 */
   if (v.mode_name != nullptr) {
