@@ -86,6 +86,62 @@ CONF_OPENING = "opening"
 #: ⚠️ C++ 側 `CoverOpening` と名前で対応させる。
 COVER_OPENINGS = {"center": 0, "left": 1, "right": 2}
 
+# ── climate の運転モード ────────────────────────────────────────────────
+CONF_MODES = "modes"
+
+#: Home Assistant の `HVACMode` の全語彙。
+#: ⚠️ **一次情報から取っている**（`homeassistant/components/climate/const.py` の
+#:    `class HVACMode(StrEnum)`。2026-08-11 に実物を読んで確認）。
+#: ⚠️ **ここに無い綴りはビルドで落とす。** 実行時に黙って効かないより、書いた時点で分かる方がよい（Y5）。
+#: ⚠️ C++ 側 `HvacMode` と名前で対応させる。
+CLIMATE_MODES = {
+    "off": 0,
+    "heat": 1,
+    "cool": 2,
+    "heat_cool": 3,
+    "auto": 4,
+    "dry": 5,
+    "fan_only": 6,
+}
+
+
+def _climate_mode(value):
+    """運転モードを1つ検める。
+
+    ⚠️ **YAMLは裸の `off` を真偽値 `False` にする**（`on`/`yes`/`no` も同様。YAML 1.1）。
+    `off` は Home Assistant の正当な運転モード名なので、**利用者が
+    `modes: [cool, heat, off]` と書くのは自然**——ここで拾わないと
+    「Auto-converted this value to boolean」という、原因の見えない失敗になる。
+    引用符で括れとだけ言うより、**こちらで受ける**方がよい。
+    """
+    if value is False:
+        return "off"
+    if value is True:
+        # ⚠️ `on` という運転モードは無い。**黙って何かに読み替えない。**
+        raise cv.Invalid(
+            "modes: に `on` は書けません（Home Assistant の運転モードに `on` はありません）。"
+            f"使えるのは {', '.join(CLIMATE_MODES)} です"
+        )
+    return cv.one_of(*CLIMATE_MODES, lower=True)(value)
+
+
+def _validate_modes(config):
+    """`modes:` の並びを検める。
+
+    ⚠️ **機器が対応しているかはここでは分からない**——ビルド時にHAへ問い合わせる経路が無い
+    （0.1.1で確認済み）。対応の有無は実行時に `hvac_modes` を購読して見る。
+    ここで見られるのは**綴りと並び方**だけ。
+    """
+
+    modes = config.get(CONF_MODES, [])
+    if len(set(modes)) != len(modes):
+        raise cv.Invalid(
+            f"modes: に同じモードが2回書かれています（{modes}）。"
+            "長押しで一周する並びなので、重複すると同じ場所を2度通ります"
+        )
+    return config
+
+
 # ── generic のジェスチャ ────────────────────────────────────────────────
 CONF_TAP = "tap"
 CONF_HOLD = "hold"
@@ -207,8 +263,12 @@ _COMMON = {
 }
 
 
-def _entity_slot(type_name, schema_extra=None):
-    """entity を1つ持つ種別のスキーマ。"""
+def _entity_slot(type_name, schema_extra=None, *extra_validators):
+    """entity を1つ持つ種別のスキーマ。
+
+    `extra_validators` は種別固有の検めごと。⚠️ **スキーマの後に走る**ので、
+    既定値が入った状態を見られる。
+    """
     d = dict(_COMMON)
     d[cv.Required(CONF_ENTITY_ID)] = cv.entity_id
     if schema_extra:
@@ -217,6 +277,7 @@ def _entity_slot(type_name, schema_extra=None):
         cv.Schema(d),
         _entity_domain_validator(type_name),
         _default_icon_validator(type_name),
+        *extra_validators,
     )
 
 
@@ -264,7 +325,16 @@ GENERIC_SCHEMA = cv.All(
 SLOT_SCHEMA = cv.typed_schema(
     {
         SLOT_TYPE_LIGHT: _entity_slot(SLOT_TYPE_LIGHT),
-        SLOT_TYPE_CLIMATE: _entity_slot(SLOT_TYPE_CLIMATE),
+        SLOT_TYPE_CLIMATE: _entity_slot(
+            SLOT_TYPE_CLIMATE,
+            {
+                # ⚠️ **長押しで一周する並び。** 書かなければ長押しは効かず、案内にも出ない。
+                #    ⚠️ **温度域（min/max）はここに書かせない**——保存すると買い替え時に
+                #    古い値が凍る。モードは利用者が選ぶ、範囲は機器に従う（G3）。
+                cv.Optional(CONF_MODES, default=[]): cv.ensure_list(_climate_mode),
+            },
+            _validate_modes,
+        ),
         SLOT_TYPE_COVER: _entity_slot(
             SLOT_TYPE_COVER,
             {
@@ -410,6 +480,10 @@ async def to_code(config):
         )
         if slot[CONF_TYPE] == SLOT_TYPE_COVER:
             cg.add(var.set_cover_opening(index, COVER_OPENINGS[slot[CONF_OPENING]]))
+        if slot[CONF_TYPE] == SLOT_TYPE_CLIMATE:
+            # ⚠️ **YAMLに書いた順のまま渡す。** 長押しはこの並びを一周する。
+            for mode in slot[CONF_MODES]:
+                cg.add(var.add_climate_mode(index, CLIMATE_MODES[mode]))
         # ⚠️ **サービス名はここで解決して渡す。** C++側に表を持たせない——
         #    表がPython側にあれば、**押せない組み合わせはビルドで落ちる**。
         for gesture, gesture_id in GESTURES.items():

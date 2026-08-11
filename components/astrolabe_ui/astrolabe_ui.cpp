@@ -6,6 +6,7 @@
 #include "esphome/core/hal.h"
 #include "esphome/core/log.h"
 
+#include "climate_render.hpp"
 #include "clock_render.hpp"
 #include "cover_render.hpp"
 #include "generic_render.hpp"
@@ -70,6 +71,17 @@ void AstrolabeUI::set_cover_opening(int slot, uint8_t opening) {
   this->slots_[slot].opening = static_cast<CoverOpening>(opening);
 }
 
+void AstrolabeUI::add_climate_mode(int slot, uint8_t mode) {
+  if (slot < 0 || slot >= static_cast<int>(this->slots_.size())) {
+    ESP_LOGE(TAG, "climate mode for slot %d has nowhere to go", slot);
+    return;
+  }
+  /* ⚠️ **YAMLに書かれた順のまま積む。** 長押しはこの並びを一周する。
+     ⚠️ **対応しているかはここでは分からない**——ビルド時にHAへ問い合わせる経路が無い。
+     対応の有無は実行時に `climate_modes_` を見る（B'）。 */
+  this->slots_[slot].modes.push_back(mode);
+}
+
 void AstrolabeUI::setup() {
   /* 電源保持を最初に立てる。 */
   gpio_reset_pin(PIN_PWR_HOLDING);
@@ -99,6 +111,19 @@ void AstrolabeUI::setup() {
     c.store(static_cast<uint8_t>(CoverState::UNKNOWN));
   }
   for (auto &c : this->cover_features_) {
+    c.store(0);
+  }
+  /* ⚠️ **温度は NaN が「無い」。** `-1` は正当な温度になりうるので使えない。 */
+  for (auto *arr : {&this->climate_target_, &this->climate_current_, &this->climate_min_, &this->climate_max_,
+                    &this->climate_step_}) {
+    for (auto &c : *arr) {
+      c.store(NAN);
+    }
+  }
+  for (auto &c : this->climate_mode_) {
+    c.store(static_cast<uint8_t>(HvacMode::UNKNOWN));
+  }
+  for (auto &c : this->climate_modes_) {
     c.store(0);
   }
   for (auto &c : this->ct_capable_) {
@@ -186,6 +211,16 @@ void AstrolabeUI::setup() {
       this->subscribe_homeassistant_state(&AstrolabeUI::on_ha_ct_min_, s.entity_id, "min_color_temp_kelvin");
       this->subscribe_homeassistant_state(&AstrolabeUI::on_ha_ct_max_, s.entity_id, "max_color_temp_kelvin");
       ESP_LOGCONFIG(TAG, "  subscribe %s: brightness, color temp (4)", s.entity_id.c_str());
+    } else if (s.type == SlotType::CLIMATE) {
+      this->subscribe_homeassistant_state(&AstrolabeUI::on_ha_climate_target_, s.entity_id, "temperature");
+      this->subscribe_homeassistant_state(&AstrolabeUI::on_ha_climate_current_, s.entity_id, "current_temperature");
+      this->subscribe_homeassistant_state(&AstrolabeUI::on_ha_climate_min_, s.entity_id, "min_temp");
+      this->subscribe_homeassistant_state(&AstrolabeUI::on_ha_climate_max_, s.entity_id, "max_temp");
+      /* ⚠️ **刻みは機器に従う**（Y4）。実機で 1 の機器と 0.5 の機器が混在していた。 */
+      this->subscribe_homeassistant_state(&AstrolabeUI::on_ha_climate_step_, s.entity_id, "target_temp_step");
+      /* ⚠️ **対応モードは実行時にしか分からない。** ビルド時にHAへ問い合わせる経路が無い。 */
+      this->subscribe_homeassistant_state(&AstrolabeUI::on_ha_climate_modes_, s.entity_id, "hvac_modes");
+      ESP_LOGCONFIG(TAG, "  subscribe %s: temp, range, step, modes (6)", s.entity_id.c_str());
     } else if (s.type == SlotType::COVER) {
       this->subscribe_homeassistant_state(&AstrolabeUI::on_ha_cover_position_, s.entity_id, "current_position");
       /* ⚠️ **できることのビット。** 位置指定を持たない機器でノブを効かせないため。 */
@@ -203,10 +238,65 @@ void AstrolabeUI::setup() {
   ESP_LOGI(TAG, "ready: %d slots, ui task on core 1", static_cast<int>(this->slots_.size()));
 }
 
+/** モードの綴り。⚠️ **`HvacMode` の並びと1対1**（添字がそのまま値）。
+ * ⚠️ Home Assistant の `HVACMode` から取っている（2026-08-11 に一次情報を確認）。 */
+static const char *const HVAC_MODE_NAMES[] = {"off", "heat", "cool", "heat_cool", "auto", "dry", "fan_only"};
+static constexpr int HVAC_NAME_COUNT = 7;
+/** ⚠️ **語彙に無い**ことを表す。`HvacMode::UNKNOWN` と同じ値。 */
+static constexpr uint8_t HVAC_UNKNOWN = 255;
+
+/** repr の中に、そのモードが**独立した項目として**入っているか。
+ *
+ * ⚠️ **部分一致では判定できない。** `heat` は `heat_cool` の部分文字列なので、
+ * 素朴に探すと「`heat_cool` しか持たない機器が `heat` にも対応している」と読んでしまう。
+ * 色モード（`supported_color_modes`）で部分一致にしたのは、**語彙に包含関係が無かったから**で、
+ * ここではその前提が成り立たない。
+ *
+ * ⚠️ 値は Python の repr。実機で観測した色モードの形は
+ * `[<ColorMode.COLOR_TEMP: 'color_temp'>]` だった——**enum が repr のまま**入る。
+ * どちらの形（`['heat']` / `[<HVACMode.HEAT: 'heat'>]`）でも、
+ * **引用符で挟んだ綴り** `'heat'` は現れ、`'heat_cool'` とは一致しない。そこを見る。
+ */
+static bool hvac_repr_has_(const std::string &repr, const char *name) {
+  std::string quoted = "'";
+  quoted += name;
+  quoted += "'";
+  if (repr.find(quoted) != std::string::npos) {
+    return true;
+  }
+  /* ⚠️ repr が二重引用符で来る形にも備える。**手当てが1行で済むうちに書いておく。** */
+  quoted = '"';
+  quoted += name;
+  quoted += '"';
+  return repr.find(quoted) != std::string::npos;
+}
+
+/** 状態の文字列 → `HvacMode`。⚠️ **完全一致**（部分一致は上の理由で使えない）。 */
+static uint8_t hvac_mode_from_(const std::string &value) {
+  for (int i = 0; i < HVAC_NAME_COUNT; i++) {
+    if (value == HVAC_MODE_NAMES[i]) {
+      return static_cast<uint8_t>(i);
+    }
+  }
+  return HVAC_UNKNOWN;
+}
+
 void AstrolabeUI::on_ha_state_(std::string entity_id, std::string state) {
   /* ⚠️ **メインループ（core 0）から呼ばれる。** ここで触ってよいのは atomic だけ。 */
   for (size_t i = 0; i < this->slots_.size(); i++) {
     if (this->slots_[i].entity_id != entity_id) {
+      continue;
+    }
+    if (this->slots_[i].type == SlotType::CLIMATE) {
+      /* ⚠️ **冷暖房の state は運転モードそのもの**（`off` / `cool` / `heat` …）。
+         ON/OFF の二値ではないので、ライトの解釈に混ぜない。
+         ⚠️ 「消えている」は **`off` というモード**であって、状態が無いことではない。 */
+      const uint8_t m = hvac_mode_from_(state);
+      this->climate_mode_[i].store(m);
+      if (m == HVAC_UNKNOWN) {
+        /* ⚠️ `unavailable` / `unknown` はここへ落ちる。**推測して埋めない。** */
+        ESP_LOGD(TAG, "%s -> '%s' is not an hvac mode; treating as unknown", entity_id.c_str(), state.c_str());
+      }
       continue;
     }
     if (this->slots_[i].type == SlotType::COVER) {
@@ -368,6 +458,56 @@ void AstrolabeUI::on_ha_cover_features_(std::string entity_id, std::string value
   });
 }
 
+void AstrolabeUI::on_ha_climate_target_(std::string entity_id, std::string value) {
+  float v = NAN;
+  const bool ok = parse_number(value, &v);
+  this->for_each_slot_(entity_id, [&](int i) { this->climate_target_[i].store(ok ? v : NAN); });
+  if (!ok) {
+    /* ⚠️ 消えているときは `None` が来る。**0℃と混ぜない。** */
+    ESP_LOGD(TAG, "%s.temperature: '%s' is not a number; treating as absent", entity_id.c_str(), value.c_str());
+  }
+}
+
+void AstrolabeUI::on_ha_climate_current_(std::string entity_id, std::string value) {
+  float v = NAN;
+  const bool ok = parse_number(value, &v);
+  this->for_each_slot_(entity_id, [&](int i) { this->climate_current_[i].store(ok ? v : NAN); });
+}
+
+void AstrolabeUI::on_ha_climate_min_(std::string entity_id, std::string value) {
+  float v = NAN;
+  const bool ok = parse_number(value, &v);
+  this->for_each_slot_(entity_id, [&](int i) { this->climate_min_[i].store(ok ? v : NAN); });
+}
+
+void AstrolabeUI::on_ha_climate_max_(std::string entity_id, std::string value) {
+  float v = NAN;
+  const bool ok = parse_number(value, &v);
+  this->for_each_slot_(entity_id, [&](int i) { this->climate_max_[i].store(ok ? v : NAN); });
+}
+
+void AstrolabeUI::on_ha_climate_step_(std::string entity_id, std::string value) {
+  float v = NAN;
+  const bool ok = parse_number(value, &v);
+  /* ⚠️ **0や負の刻みは受け取らない。** 受けるとノブが動かなくなる／逆に動く。
+     届かなかったのと同じ扱いにして、既定の0.5へ落とす（Y4）。 */
+  this->for_each_slot_(entity_id, [&](int i) { this->climate_step_[i].store((ok && v > 0.0f) ? v : NAN); });
+}
+
+void AstrolabeUI::on_ha_climate_modes_(std::string entity_id, std::string value) {
+  uint16_t mask = 0;
+  for (int i = 0; i < HVAC_NAME_COUNT; i++) {
+    if (hvac_repr_has_(value, HVAC_MODE_NAMES[i])) {
+      mask |= static_cast<uint16_t>(1u << i);
+    }
+  }
+  this->for_each_slot_(entity_id, [&](int i) {
+    if (this->climate_modes_[i].exchange(mask) != mask) {
+      ESP_LOGI(TAG, "%s: hvac modes 0x%02X from %s", entity_id.c_str(), mask, value.c_str());
+    }
+  });
+}
+
 bool AstrolabeUI::light_ct_available_(int slot, int *min_k, int *max_k) const {
   if (slot < 0 || slot >= static_cast<int>(this->slots_.size())) {
     return false;
@@ -475,6 +615,18 @@ void AstrolabeUI::loop() {
         ESP_LOGI(TAG, "cover %s %s", action.cover_service, entity.c_str());
         this->call_homeassistant_service(std::string("cover.") + action.cover_service,
                                          {{"entity_id", entity}});
+        break;
+
+      case ActionKind::SET_CLIMATE_TEMP:
+        ESP_LOGD(TAG, "set %s temperature=%.1f", entity.c_str(), static_cast<double>(action.temperature));
+        this->call_homeassistant_service("climate.set_temperature",
+                                         {{"entity_id", entity}, {"temperature", to_string(action.temperature)}});
+        break;
+
+      case ActionKind::SET_HVAC_MODE:
+        ESP_LOGD(TAG, "set %s hvac_mode=%s", entity.c_str(), HVAC_MODE_NAMES[action.hvac_mode]);
+        this->call_homeassistant_service("climate.set_hvac_mode",
+                                         {{"entity_id", entity}, {"hvac_mode", HVAC_MODE_NAMES[action.hvac_mode]}});
         break;
 
       case ActionKind::SET_COVER_POSITION:
@@ -585,7 +737,24 @@ bool AstrolabeUI::open_app_(int index, uint32_t now) {
       return true;
     }
 
-    case SlotType::CLIMATE:
+    case SlotType::CLIMATE: {
+      this->climate_app_ = ClimateAppState{};
+      this->climate_sync_(index);
+      /* ⚠️ **カーソルはHAの報告に寄せる**——いま動いているモードから始まらないと、
+         長押し1回目がどこへ飛ぶか分からない。
+         ⚠️ **寄せられないときは「並びの最後」に置く。** 長押しは `cursor+1` へ進むので、
+         こうしておくと**1回目がちょうど先頭**になる。0 を置くと1回目が2番目へ飛ぶ。 */
+      const auto &modes = this->slots_[index].modes;
+      this->climate_app_.cursor = modes.empty() ? 0 : static_cast<uint8_t>(modes.size() - 1);
+      this->climate_app_.cursor_synced = false;
+      this->climate_cursor_sync_(index);
+      this->app_slot_ = index;
+      this->set_screen_(Screen::APP);
+      this->last_activity_ms_ = now;
+      ESP_LOGI(TAG, "open app: slot %d (climate) mode=%u", index, this->climate_mode_[index].load());
+      return true;
+    }
+
     case SlotType::MEDIA_PLAYER:
       /* ⚠️ **まだ画面が無い。** 黙って開いて何も出さないより、開かない方がよい。 */
       break;
@@ -657,6 +826,10 @@ void AstrolabeUI::on_touch_long_(uint32_t now) {
   }
   if (this->app_slot_ >= 0 && this->slots_[this->app_slot_].type == SlotType::GENERIC) {
     this->fire_gesture_(Gesture::HOLD, now);
+    return;
+  }
+  if (this->app_slot_ >= 0 && this->slots_[this->app_slot_].type == SlotType::CLIMATE) {
+    this->climate_rotate_mode_(now);
     return;
   }
   if (!this->light_ct_available_(this->app_slot_, nullptr, nullptr)) {
@@ -748,6 +921,154 @@ void AstrolabeUI::fire_gesture_(Gesture g, uint32_t now) {
   this->generic_app_.fired = g;
   this->generic_app_.offline = !(online && queued);
   this->generic_app_.at_ms = now;
+}
+
+void AstrolabeUI::climate_sync_(int slot) {
+  const float lo = this->climate_min_[slot].load();
+  const float hi = this->climate_max_[slot].load();
+  if (std::isnan(lo) || std::isnan(hi) || !(hi > lo)) {
+    /* ⚠️ **範囲が無ければ何もできない値に戻す。** 恣意的な範囲を作らない。 */
+    this->climate_app_.target.clear_bounds();
+  } else {
+    this->climate_app_.target.set_bounds(lo, hi);
+  }
+  const float t = this->climate_target_[slot].load();
+  if (std::isnan(t)) {
+    /* ⚠️ 消えていると `temperature` は `None` になる。**0℃ と混ぜない。** */
+    this->climate_app_.target.clear_reported();
+  } else {
+    this->climate_app_.target.set_reported(t);
+  }
+  this->climate_app_.reported = static_cast<HvacMode>(this->climate_mode_[slot].load());
+}
+
+void AstrolabeUI::climate_cursor_sync_(int slot) {
+  if (this->climate_app_.cursor_synced) {
+    return;
+  }
+  const auto &modes = this->slots_[slot].modes;
+  if (modes.empty()) {
+    return;
+  }
+  const uint8_t reported = this->climate_mode_[slot].load();
+  if (reported == static_cast<uint8_t>(HvacMode::UNKNOWN)) {
+    /* まだ届いていない。⚠️ **寄せずに待つ**——届いてから合わせる方が、
+       先頭に固定してしまうより当たる。 */
+    return;
+  }
+  for (size_t i = 0; i < modes.size(); i++) {
+    if (modes[i] == reported) {
+      this->climate_app_.cursor = static_cast<uint8_t>(i);
+      this->climate_app_.cursor_synced = true;
+      return;
+    }
+  }
+  /* ⚠️ **報告が `modes:` に無い**（書いていない `off` や `dry` で運転中など）。
+     **並びの最後に置く**——長押しは `cursor+1` へ進むので、**1回目がちょうど先頭**になる。
+     ここを決めておかないと、カーソルが古いままで回し始めが読めなくなる。 */
+  this->climate_app_.cursor = static_cast<uint8_t>(modes.size() - 1);
+  this->climate_app_.cursor_synced = true;
+}
+
+bool AstrolabeUI::climate_mode_supported_(int slot, uint8_t mode) const {
+  const uint16_t mask = this->climate_modes_[slot].load();
+  if (mask == 0) {
+    /* ⚠️ **まだ届いていない。** 「対応していない」と言い切らない——
+       届く前に赤字を出すと、起動直後にいつも嘘をつくことになる。 */
+    return true;
+  }
+  return (mask & static_cast<uint16_t>(1u << mode)) != 0;
+}
+
+void AstrolabeUI::climate_app_input_(Input in, uint32_t now) {
+  if (in != Input::ROTATE_CW && in != Input::ROTATE_CCW) {
+    return;
+  }
+  /* ⚠️ **刻みは機器に従う**（Y4）。届いていなければ0.5。
+     実機には 1 の機器と 0.5 の機器が両方あった——固定にすると必ずどちらかと喧嘩する。 */
+  const float reported_step = this->climate_step_[this->app_slot_].load();
+  const float step = std::isnan(reported_step) ? CLIMATE_TEMP_STEP_DEFAULT : reported_step;
+
+  /* ⚠️ **範囲だけ入れ直す。** `set_reported` は「利用者が選んだ」印を倒すので、
+     回している最中に呼ばない（`light` と同じ作法）。 */
+  const float lo = this->climate_min_[this->app_slot_].load();
+  const float hi = this->climate_max_[this->app_slot_].load();
+  if (!std::isnan(lo) && !std::isnan(hi) && hi > lo) {
+    this->climate_app_.target.set_bounds(lo, hi);
+  }
+  if (!this->climate_app_.target.step((in == Input::ROTATE_CW) ? step : -step)) {
+    /* ⚠️ **値も範囲も知らないうちは動かさない**（Y1・U1）。 */
+    ESP_LOGD(TAG, "climate: target unknown; knob does nothing");
+    return;
+  }
+  this->climate_app_.last_local_change_ms = now;
+  this->climate_app_.publish_pending = true;
+  ESP_LOGD(TAG, "climate: target=%.1f (step %.1f)", static_cast<double>(this->climate_app_.target.value()),
+           static_cast<double>(step));
+}
+
+void AstrolabeUI::climate_rotate_mode_(uint32_t now) {
+  const auto &modes = this->slots_[this->app_slot_].modes;
+  if (modes.empty()) {
+    /* ⚠️ **無音で断る。** 画面に `hold: mode` を出していないので、
+       ここで鳴らすと「何かが起きた」という嘘になる（`cover` の停止と同じ作法）。 */
+    ESP_LOGD(TAG, "climate: no modes configured; long press refused");
+    return;
+  }
+  this->climate_cursor_sync_(this->app_slot_);
+  this->climate_app_.cursor = static_cast<uint8_t>((this->climate_app_.cursor + 1) % modes.size());
+  this->climate_app_.cursor_synced = true;
+  const uint8_t mode = modes[this->climate_app_.cursor];
+  this->last_activity_ms_ = now;
+  /* ⚠️ **他のどれとも違う音**（`light` の DIM⇔CLR と同じ位置づけ）。 */
+  this->beep_(BEEP_HZ_MODE, BEEP_MS_MODE);
+
+  if (!this->climate_mode_supported_(this->app_slot_, mode)) {
+    /* ⚠️ **B'**: 並びからは外さない。**画面に「非対応」と出し、何も送らない。**
+       外して詰めると「書いたのに来ない」になり、送ると「切り替えたのに動かない」になる。
+       ⚠️ **音は鳴らす**——カーソルは動いているので、無音だと長押しを取りこぼしたように見える。 */
+    ESP_LOGI(TAG, "climate: mode %s not supported by this device; not sending", HVAC_MODE_NAMES[mode]);
+    return;
+  }
+
+  Action a{};
+  a.kind = ActionKind::SET_HVAC_MODE;
+  a.slot = static_cast<uint8_t>(this->app_slot_);
+  a.hvac_mode = mode;
+  if (xQueueSend(this->action_queue_, &a, 0) != pdTRUE) {
+    this->dropped_actions_.fetch_add(1);
+    ESP_LOGW(TAG, "climate mode dropped: action queue full");
+    return;
+  }
+  ESP_LOGI(TAG, "climate: mode -> %s", HVAC_MODE_NAMES[mode]);
+}
+
+void AstrolabeUI::climate_app_publish_(uint32_t now) {
+  if (!this->climate_app_.publish_pending) {
+    return;
+  }
+  /* ⚠️ **間引きは `light` と同じ120ms。** カーテンだけが「静定してから最終値」で、
+     冷暖房はそちらではない——設定温度は送っても物理的な移動を割り込まない。 */
+  if (now - this->climate_app_.last_publish_ms < PUBLISH_INTERVAL_MS) {
+    return;
+  }
+  float temp = 0.0f;
+  if (!this->climate_app_.target.to_send(&temp)) {
+    /* ⚠️ **利用者が選んでいない値は送らない。** 丸めた推測は見せるだけ。 */
+    this->climate_app_.publish_pending = false;
+    return;
+  }
+  this->climate_app_.last_publish_ms = now;
+  this->climate_app_.publish_pending = false;
+
+  Action a{};
+  a.kind = ActionKind::SET_CLIMATE_TEMP;
+  a.slot = static_cast<uint8_t>(this->app_slot_);
+  a.temperature = temp;
+  if (xQueueSend(this->action_queue_, &a, 0) != pdTRUE) {
+    this->dropped_actions_.fetch_add(1);
+    ESP_LOGW(TAG, "climate temperature dropped: action queue full");
+  }
 }
 
 void AstrolabeUI::cover_app_input_(Input in, uint32_t now) {
@@ -843,6 +1164,8 @@ void AstrolabeUI::app_input_(Input in, uint32_t now) {
       this->cover_app_input_(in, now);
       return;
     case SlotType::CLIMATE:
+      this->climate_app_input_(in, now);
+      return;
     case SlotType::MEDIA_PLAYER:
       /* まだ実装していない。⚠️ **開けないので、ここへは来ない**（`open_app_` が断る）。 */
       return;
@@ -1001,6 +1324,22 @@ void AstrolabeUI::on_touch_short_(uint32_t now) {
            古い目標値が画面に出続ける。 */
         this->cover_app_.position.set_chosen(closing ? 0.0f : 100.0f);
         this->cover_app_.publish_pending = false;
+        return;
+      }
+      if (this->app_slot_ >= 0 && this->slots_[this->app_slot_].type == SlotType::CLIMATE) {
+        /* ⚠️ **`climate.toggle` は実在する**（2026-08-11 にHAのサービス一覧で確認）。
+           ライトのように「明るさを添えて turn_on」する必要が無いので、素直に投げる。 */
+        this->last_activity_ms_ = now;
+        this->beep_(BEEP_HZ_ACTION);
+        Action a{};
+        a.kind = ActionKind::TOGGLE_SLOT;
+        a.slot = static_cast<uint8_t>(this->app_slot_);
+        if (xQueueSend(this->action_queue_, &a, 0) != pdTRUE) {
+          /* ⚠️ **黙って捨てない**（Y3）。診断に出る数を増やす。 */
+          this->dropped_actions_.fetch_add(1);
+          ESP_LOGW(TAG, "climate toggle dropped: action queue full");
+        }
+        ESP_LOGI(TAG, "climate: toggle");
         return;
       }
       /* アプリの中でのタップはトグル。 */
@@ -1185,6 +1524,52 @@ void AstrolabeUI::ui_task_() {
                               !slot.gestures[static_cast<int>(Gesture::ROTATE_LEFT)].service.empty();
             render_generic(this->canvas_, view);
           }
+          this->canvas_->pushSprite(0, 0);
+          break;
+        }
+
+        if (this->app_slot_ >= 0 && this->slots_[this->app_slot_].type == SlotType::CLIMATE) {
+          if (now - this->last_activity_ms_ >= IDLE_TIMEOUT_MS) {
+            /* ⚠️ **戻る前に、溜まっている設定温度を出し切る。** */
+            this->climate_app_.last_publish_ms = 0;
+            this->climate_app_publish_(now);
+            ESP_LOGI(TAG, "app -> clock (idle)");
+            this->set_screen_(Screen::CLOCK);
+            this->app_slot_ = -1;
+            this->last_clock_render_ms_ = now - CLOCK_RENDER_MS;
+            break;
+          }
+
+          /* HAからのこだま。⚠️ **ローカル操作の直後は無視する**——
+             回している最中に古い値で上書きすると、ノブと綱引きになる。 */
+          if (now - this->climate_app_.last_local_change_ms >= LOCAL_CHANGE_GUARD_MS) {
+            this->climate_sync_(this->app_slot_);
+          } else {
+            /* 温度は触らないが、⚠️ **運転モードの報告は常に取り込む**——
+               回している最中に別の場所からモードが変わっても、色は追随してよい。 */
+            this->climate_app_.reported = static_cast<HvacMode>(this->climate_mode_[this->app_slot_].load());
+          }
+          this->climate_cursor_sync_(this->app_slot_);
+          this->climate_app_publish_(now);
+
+          const auto &modes = this->slots_[this->app_slot_].modes;
+          ClimateView view{};
+          view.target = this->climate_app_.target.usable() ? this->climate_app_.target.value() : NAN;
+          view.current = this->climate_current_[this->app_slot_].load();
+          view.min_temp = this->climate_min_[this->app_slot_].load();
+          view.max_temp = this->climate_max_[this->app_slot_].load();
+          view.have_range = this->climate_app_.target.have_bounds();
+          if (!modes.empty()) {
+            const uint8_t m = modes[this->climate_app_.cursor];
+            view.mode_name = HVAC_MODE_NAMES[m];
+            view.mode_unsupported = !this->climate_mode_supported_(this->app_slot_, m);
+          }
+          const uint8_t rep = static_cast<uint8_t>(this->climate_app_.reported);
+          view.state_received = (rep != static_cast<uint8_t>(HvacMode::UNKNOWN));
+          view.reported_name = view.state_received ? HVAC_MODE_NAMES[rep] : nullptr;
+          /* ⚠️ **「消えている」は `off` というモード。** 状態が無いことではない。 */
+          view.is_on = view.state_received && this->climate_app_.reported != HvacMode::OFF;
+          render_climate(this->canvas_, view);
           this->canvas_->pushSprite(0, 0);
           break;
         }

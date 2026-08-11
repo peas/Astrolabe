@@ -58,6 +58,8 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
 
   /** `cover` の布がどちら側から伸びるか。⚠️ **見た目だけ。** */
   void set_cover_opening(int slot, uint8_t opening);
+  /** `climate` の運転モードを1つ、YAMLに書かれた順で足す。⚠️ **`setup()` より前に呼ばれる。** */
+  void add_climate_mode(int slot, uint8_t mode);
 
   void setup() override;
   void loop() override;
@@ -143,6 +145,9 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
    * 範囲は個体ごとに違うので Home Assistant に従うが、刻みの粗さは好みの問題で、
    * 「同じ製品の別の個体で当然に違うもの」ではない。 */
   static constexpr int COLOR_TEMP_STEP = 200;
+  /** 設定温度の1目盛り。⚠️ **`target_temp_step` が届かなかったときだけ**使う（Y4）。
+   * 実機には 1 の機器と 0.5 の機器の両方があった——固定にすると必ずどちらかと喧嘩する。 */
+  static constexpr float CLIMATE_TEMP_STEP_DEFAULT = 0.5f;
   /** 回している間の送信間引き。
    * ⚠️ これが無いとノブ1目盛りごとにHAを叩く。 */
   static constexpr uint32_t PUBLISH_INTERVAL_MS = 120;
@@ -208,7 +213,16 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
 
   /** 描画タスク → メインループ。**Home Assistant を呼ぶ意図。**
    * ⚠️ `SET_LIGHT` は `slot` と `brightness` を伴うので、単なる列挙ではなく構造体で渡す。 */
-  enum class ActionKind : uint8_t { TOGGLE_SLOT, SET_LIGHT, BEEP, CALL_GESTURE, COVER_ACTION, SET_COVER_POSITION };
+  enum class ActionKind : uint8_t {
+    TOGGLE_SLOT,
+    SET_LIGHT,
+    BEEP,
+    CALL_GESTURE,
+    COVER_ACTION,
+    SET_COVER_POSITION,
+    SET_CLIMATE_TEMP,
+    SET_HVAC_MODE,
+  };
 
   struct Action {
     ActionKind kind;
@@ -230,6 +244,10 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
     const char *cover_service;
     /** `SET_COVER_POSITION` のときの 0-100。 */
     int16_t position;
+    /** `SET_CLIMATE_TEMP` のときの設定温度（℃）。 */
+    float temperature;
+    /** `SET_HVAC_MODE` のときの `HvacMode`。 */
+    uint8_t hvac_mode;
     bool is_on;
   };
 
@@ -246,6 +264,21 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
    * ⚠️ Python側 `COVER_OPENINGS` と一緒に増やす。 */
   enum class CoverOpening : uint8_t { CENTER = 0, LEFT = 1, RIGHT = 2 };
 
+  /** Home Assistant の `HVACMode` の全語彙。
+   * ⚠️ **一次情報から取っている**（`homeassistant/components/climate/const.py`。2026-08-11 確認）。
+   * ⚠️ Python側 `CLIMATE_MODES` と**名前で**対応させる（並びに依存しない）。
+   * `UNKNOWN` は**HAの語彙ではない**——まだ届いていない／読めなかったとき用。 */
+  enum class HvacMode : uint8_t {
+    OFF = 0,
+    HEAT = 1,
+    COOL = 2,
+    HEAT_COOL = 3,
+    AUTO = 4,
+    DRY = 5,
+    FAN_ONLY = 6,
+    UNKNOWN = 255,
+  };
+
   /** 調光画面のモード。⚠️ **長押しで行き来する。** */
   enum class LightMode : uint8_t { DIMMER, COLOR_TEMP };
 
@@ -259,6 +292,11 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
     GestureTarget gestures[static_cast<int>(Gesture::COUNT)];
     /** ⚠️ `cover` のときだけ意味がある。 */
     CoverOpening opening;
+    /** ⚠️ `climate` のときだけ。**YAMLに書かれた順**の運転モード。長押しで一周する。
+     * ⚠️ **空なら長押しは効かず、案内にも出さない**（`cover` の `can_stop` と同じ作法）。
+     * ⚠️ **機器が対応しているかはここには入っていない**——対応は `hvac_modes_` を見る。
+     * 対応していないモードも並びから外さない（**B'**: 間違いが見えるうえに、無効な値は送らない）。 */
+    std::vector<uint8_t> modes;
   };
 
   /** `generic` の画面の直後の状態。
@@ -278,6 +316,23 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
   static constexpr uint32_t COVER_FEAT_CLOSE = 2;
   static constexpr uint32_t COVER_FEAT_SET_POSITION = 4;
   static constexpr uint32_t COVER_FEAT_STOP = 8;
+
+  /** 冷暖房の画面の編集中の値。⚠️ **描画タスクの持ち物。** */
+  struct ClimateAppState {
+    /** 設定温度。⚠️ **範囲つきの値**なので、未着なら回しても動かず、送りもしない。 */
+    HaRange target;
+    /** いまHAが言っている運転モード。 */
+    HvacMode reported;
+    /** ⚠️ **YAMLの並びの何番目を指しているか。** 長押しで進む。
+     * `slots_[slot].modes` が空なら意味を持たない。 */
+    uint8_t cursor;
+    /** ⚠️ **カーソルがまだHAの報告に合わせられていない。**
+     * 初回だけHAのモードへ寄せ、以後は利用者の操作で動く。 */
+    bool cursor_synced;
+    uint32_t last_local_change_ms;
+    uint32_t last_publish_ms;
+    bool publish_pending;
+  };
 
   struct CoverAppState {
     /** 0-100。⚠️ **範囲つきの値**なので、未着なら回しても動かず、送りもしない。 */
@@ -387,6 +442,14 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
   void on_ha_color_modes_(std::string entity_id, std::string value);
   void on_ha_cover_position_(std::string entity_id, std::string value);
   void on_ha_cover_features_(std::string entity_id, std::string value);
+  void on_ha_climate_target_(std::string entity_id, std::string value);
+  void on_ha_climate_current_(std::string entity_id, std::string value);
+  void on_ha_climate_min_(std::string entity_id, std::string value);
+  void on_ha_climate_max_(std::string entity_id, std::string value);
+  void on_ha_climate_step_(std::string entity_id, std::string value);
+  /** ⚠️ 値は Python の repr。**部分一致で拾えない**——`heat` は `heat_cool` の部分文字列。
+   * 引用符ごと突き合わせる。詳細は実装のコメント。 */
+  void on_ha_climate_modes_(std::string entity_id, std::string value);
   /** ⚠️ **同じ entity を複数のスロットに書ける**ので、一致した**全部**へ配る。
    * 最初の一致で打ち切ると、2つ目以降へ状態が永久に届かない
    * （同じカーテンを開き方違いで並べて見比べる、という使い方は普通にある）。 */
@@ -399,6 +462,18 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
    * ⚠️ **`set_reported` は「利用者が選んだ」印を倒す**ので、
    * 回している最中に呼ばないこと（呼び出し側で `LOCAL_CHANGE_GUARD_MS` を見る）。 */
   void light_ct_sync_(int slot);
+  /** HAから届いている設定温度（範囲と値）と運転モードを、冷暖房画面へ写す。
+   * ⚠️ `light_ct_sync_` と同じく、**回している最中に呼ばない**。 */
+  void climate_sync_(int slot);
+  /** ⚠️ **初回だけ**、カーソルをHAが報告しているモードへ寄せる。 */
+  void climate_cursor_sync_(int slot);
+  /** ⚠️ **機器がそのモードを持っているか。** 届く前は「持っている」と答える——
+   * 起動直後に赤字を出さないため。 */
+  bool climate_mode_supported_(int slot, uint8_t mode) const;
+  void climate_app_input_(Input in, uint32_t now);
+  /** 長押しで `modes:` の並びを1つ進める。⚠️ **非対応でも並びから外さない**（B'）。 */
+  void climate_rotate_mode_(uint32_t now);
+  void climate_app_publish_(uint32_t now);
 
   LGFX_StampRing display_;
   /** ⚠️ **`display_` は描画タスクの持ち物**。`dump_config()`（メインループ）から
@@ -438,6 +513,25 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
   std::atomic<uint8_t> cover_state_[SLOTS_MAX];
   /** ⚠️ **できることのビット。** 位置指定を持たない機器でノブを効かせない。 */
   std::atomic<uint32_t> cover_features_[SLOTS_MAX];
+
+  /* ── 冷暖房 ── */
+  /** ⚠️ **温度だけは `-1` を「無い」に使えない。** 明るさ・色温度・カーテンの位置と違い、
+   * **設定温度は負にも小さい値にもなる**（実機で `min_temp: 7` を観測。氷点下を扱う機器もある）。
+   * よって**無いことは NaN で表す**——`std::isnan` でしか真にならないので、
+   * 正当な温度と衝突しない。 */
+  static_assert(std::atomic<float>::is_always_lock_free,
+                "temperature atomics must be lock-free: they cross the API/UI task boundary");
+  std::atomic<float> climate_target_[SLOTS_MAX];
+  std::atomic<float> climate_current_[SLOTS_MAX];
+  std::atomic<float> climate_min_[SLOTS_MAX];
+  std::atomic<float> climate_max_[SLOTS_MAX];
+  /** 刻み。⚠️ **NaN なら 0.5 を使う**（Y4）。実機では 1 の機器と 0.5 の機器が混在していた。 */
+  std::atomic<float> climate_step_[SLOTS_MAX];
+  /** いまの運転モード（`HvacMode`）。 */
+  std::atomic<uint8_t> climate_mode_[SLOTS_MAX];
+  /** ⚠️ **機器が対応しているモードのビット**（`1 << HvacMode`）。
+   * ⚠️ **文字列をコアの境界を越えて渡さない**ため、購読側でビットに畳んでから置く。 */
+  std::atomic<uint16_t> climate_modes_[SLOTS_MAX];
 
   /* タッチ計器の写し。**描画タスクが書き、メインループが読む。**
    * ⚠️ 生の値はタッチドライバの中にあるが、そこは描画タスクの持ち物なので直接読ませない。 */
@@ -480,6 +574,7 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
   LightAppState light_app_{};
   GenericAppState generic_app_{};
   CoverAppState cover_app_{};
+  ClimateAppState climate_app_{};
 };
 
 }  // namespace astrolabe_ui
