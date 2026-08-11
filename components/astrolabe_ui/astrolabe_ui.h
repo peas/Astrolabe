@@ -222,6 +222,7 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
     SET_COVER_POSITION,
     SET_CLIMATE_TEMP,
     SET_HVAC_MODE,
+    CLIMATE_TOGGLE,
   };
 
   struct Action {

@@ -577,8 +577,18 @@ void AstrolabeUI::loop() {
 
     switch (action.kind) {
       case ActionKind::TOGGLE_SLOT:
+        /* ⚠️ **これは `light` 専用**（サービス名が直書きしてある）。
+           他の種別を通すと、**無言で失敗する**——`call_homeassistant_service` は
+           結果を返さないので、押した側は成功と区別できない。 */
         ESP_LOGI(TAG, "toggle %s", entity.c_str());
         this->call_homeassistant_service("light.toggle", {{"entity_id", entity}});
+        break;
+
+      case ActionKind::CLIMATE_TOGGLE:
+        /* ⚠️ **`climate.toggle` は実在する**（2026-08-11 にHAのサービス一覧で確認）。
+           ⚠️ `light.toggle` を流用しない——ドメインが違えば**無言で失敗する**。 */
+        ESP_LOGI(TAG, "climate toggle %s", entity.c_str());
+        this->call_homeassistant_service("climate.toggle", {{"entity_id", entity}});
         break;
 
       case ActionKind::BEEP:
@@ -1347,20 +1357,14 @@ void AstrolabeUI::on_touch_short_(uint32_t now) {
         return;
       }
       if (this->app_slot_ >= 0 && this->slots_[this->app_slot_].type == SlotType::CLIMATE) {
-        if (this->climate_on_unsupported_mode_()) {
-          /* ⚠️ **非対応のモードを指している間は、長押し以外を受け付けない**
-             （2026-08-11 11:21 ゆの）。⚠️ **無音**——画面が「使えない」と言っているのに
-             音だけ返すと、効いたのか効かなかったのかが分からなくなる。 */
-          this->last_activity_ms_ = now;
-          ESP_LOGD(TAG, "climate: mode not supported; tap ignored (silent)");
-          return;
-        }
-        /* ⚠️ **`climate.toggle` は実在する**（2026-08-11 にHAのサービス一覧で確認）。
-           ライトのように「明るさを添えて turn_on」する必要が無いので、素直に投げる。 */
+        /* ⚠️ **どの画面でもタップはON/OFF**（2026-08-11 11:46 ゆの）——
+           **非対応のモードを指している間も効く**。
+           ⚠️ 電源の入切は「いま何モードを見ているか」と無関係な操作なので、
+           モードの都合で塞ぐと**消したいのに消せない**ことが起きる。 */
         this->last_activity_ms_ = now;
         this->beep_(BEEP_HZ_ACTION);
         Action a{};
-        a.kind = ActionKind::TOGGLE_SLOT;
+        a.kind = ActionKind::CLIMATE_TOGGLE;
         a.slot = static_cast<uint8_t>(this->app_slot_);
         if (xQueueSend(this->action_queue_, &a, 0) != pdTRUE) {
           /* ⚠️ **黙って捨てない**（Y3）。診断に出る数を増やす。 */
