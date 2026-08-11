@@ -222,7 +222,6 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
     SET_COVER_POSITION,
     SET_CLIMATE_TEMP,
     SET_HVAC_MODE,
-    CLIMATE_TOGGLE,
   };
 
   struct Action {
@@ -481,8 +480,14 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
    * ⚠️ ノブの**ボタン（戻る）だけは通す**——止めるとこの画面から出られなくなる。 */
   bool climate_on_unsupported_mode_() const;
   void climate_app_input_(Input in, uint32_t now);
-  /** 長押しで `modes:` の並びを1つ進める。⚠️ **非対応でも並びから外さない**（B'）。 */
+  /** 長押しで `modes:` の並びを1つ進める。
+   * ⚠️ **表示を動かすだけで、何も送らない**（C-CONTRACT2）。 */
   void climate_rotate_mode_(uint32_t now);
+  /** 表示中モードをHAへ送る。⚠️ **非対応なら送らずに false**（B'の最後の砦）。 */
+  bool climate_send_mode_(uint8_t mode, uint32_t now);
+  /** ⚠️ **表示中モードが、いまHAが報告している運転モードと一致しているか。**
+   * 一致していればタップは「オフ」、していなければ「そのモードを送る」。 */
+  bool climate_display_matches_running_() const;
   void climate_app_publish_(uint32_t now);
 
   LGFX_StampRing display_;

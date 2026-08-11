@@ -31,6 +31,8 @@ static constexpr uint32_t CLIMATE_HEAT_COLOR = 0xE07040;
 static constexpr uint32_t CLIMATE_COOL_COLOR = 0x40A0E0;
 static constexpr uint32_t CLIMATE_DRY_COLOR = 0xC0A040;
 static constexpr uint32_t CLIMATE_FAN_COLOR = 0x60C0A0;
+/** ⚠️ `auto` は**薄緑**（2026-08-11 ゆの）。暖房とも冷房とも言わない色。 */
+static constexpr uint32_t CLIMATE_AUTO_COLOR = 0x90D8A8;
 static constexpr uint32_t CLIMATE_TEXT_COLOR = 0xC0D0E0;
 static constexpr uint32_t CLIMATE_DIM_COLOR = 0x405060;
 static constexpr uint32_t CLIMATE_HINT_COLOR = 0x222222;
@@ -56,7 +58,10 @@ struct ClimateView {
   /** ⚠️ **いま指しているモードに機器が対応していないか。**
    * 真なら「非対応」と出し、**何も送っていない**ことを見せる（B'）。 */
   bool mode_unsupported;
-  /** HAが報告している運転モードの綴り。`nullptr` ＝ 届いていない。 */
+  /** ⚠️ **HAが報告している運転モード＝いま実際に動いているもの。**
+   * 下部にモードカラーで出す。`nullptr` ＝ 届いていない。
+   * ⚠️ **弧の色はこれではなく `mode_name`（表示中）に従う**——
+   * 色が食い違っていること自体が「まだ送っていない」の合図（N3）。 */
   const char *reported_name;
   /** 運転しているか（＝報告が `off` 以外）。円弧の色をここで決める。 */
   bool is_on;
@@ -83,7 +88,10 @@ inline uint32_t climate_mode_color(const char *name, bool is_on) {
   if (n == "fan_only") {
     return CLIMATE_FAN_COLOR;
   }
-  /* `heat_cool` / `auto` は**どちらの色にも寄せない**——嘘になる。 */
+  if (n == "auto") {
+    return CLIMATE_AUTO_COLOR;
+  }
+  /* `heat_cool` は**どちらの色にも寄せない**——嘘になる。 */
   return CLIMATE_NEUTRAL_COLOR;
 }
 
@@ -95,8 +103,10 @@ inline void render_climate(LGFX_Sprite *canvas, const ClimateView &v) {
   const bool have_target = !std::isnan(v.target);
   /* ⚠️ **非対応のときは灰に落とす。** 運転中の色（暖房＝橙 / 冷房＝青）で塗ると、
      効いていないのに効いているように見える。 */
+  /* ⚠️ **弧は「表示中モード」の色**（N3）。下部の動作中モードと色が違っていれば、
+     **まだ送っていない**ことが一目で分かる。 */
   const uint32_t col =
-      v.mode_unsupported ? CLIMATE_GRAYED_COLOR : climate_mode_color(v.reported_name, v.is_on);
+      v.mode_unsupported ? CLIMATE_GRAYED_COLOR : climate_mode_color(v.mode_name, v.is_on);
 
   /* ⚠️ **消えているときは塗らない。** 参照実装がそうしていた——
      止まっている機器で目盛りが伸びていると、動いているように見える。 */
@@ -131,6 +141,18 @@ inline void render_climate(LGFX_Sprite *canvas, const ClimateView &v) {
 
     canvas->setFont(&fonts::Font2);
     canvas->setTextSize(1.0f);
+    /* ⚠️ **非対応を見ている間も、動作中モードは出し続ける。**
+       ここを消すと「エアコンがいまどうなっているか」が分からなくなる——
+       **止まっているのか動いているのかは、非対応かどうかとは別の話**。 */
+    if (v.state_received) {
+      if (v.is_on && v.reported_name != nullptr) {
+        canvas->setTextColor(climate_mode_color(v.reported_name, true));
+        canvas->drawCenterString(v.reported_name, CLIMATE_CX, 176);
+      } else {
+        canvas->setTextColor(CLIMATE_DIM_COLOR);
+        canvas->drawCenterString("OFF", CLIMATE_CX, 176);
+      }
+    }
     canvas->setTextColor(CLIMATE_HINT_COLOR);
     /* ⚠️ **効くのは長押しだけ。** ここから出る道を書いておく。 */
     canvas->drawCenterString("hold: mode", CLIMATE_CX, 197);
@@ -181,12 +203,18 @@ inline void render_climate(LGFX_Sprite *canvas, const ClimateView &v) {
 
   canvas->setFont(&fonts::Font2);
   canvas->setTextSize(1.0f);
-  /* ⚠️ **電源の状態は言葉でも出す。** 色の濃淡だけだと、暗いのか消えているのかが
-     見分けにくい（参照実装も `ON` / `OFF` を文字で出していた）。
+  /* ⚠️ **下部は「いま実際に動いているモード」をモードカラーで**（N2）。
+     ⚠️ オフなら `OFF` を淡色——これは**選べるモードとしての off ではなく実態**なので、
+     「off は YAML に書かない限り出さない」とは矛盾しない。
      ⚠️ **届いていないときは言わない**——消えているとも点いているとも決めつけない。 */
   if (v.state_received) {
-    canvas->setTextColor(v.is_on ? CLIMATE_TEXT_COLOR : CLIMATE_DIM_COLOR);
-    canvas->drawCenterString(v.is_on ? "ON" : "OFF", CLIMATE_CX, 176);
+    if (v.is_on && v.reported_name != nullptr) {
+      canvas->setTextColor(climate_mode_color(v.reported_name, true));
+      canvas->drawCenterString(v.reported_name, CLIMATE_CX, 176);
+    } else {
+      canvas->setTextColor(CLIMATE_DIM_COLOR);
+      canvas->drawCenterString("OFF", CLIMATE_CX, 176);
+    }
   }
   canvas->setTextColor(CLIMATE_HINT_COLOR);
   /* ⚠️ **できることだけ案内する。** `modes:` が空なら長押しは効かないので書かない。 */

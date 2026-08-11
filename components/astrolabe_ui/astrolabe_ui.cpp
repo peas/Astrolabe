@@ -584,13 +584,6 @@ void AstrolabeUI::loop() {
         this->call_homeassistant_service("light.toggle", {{"entity_id", entity}});
         break;
 
-      case ActionKind::CLIMATE_TOGGLE:
-        /* ⚠️ **`climate.toggle` は実在する**（2026-08-11 にHAのサービス一覧で確認）。
-           ⚠️ `light.toggle` を流用しない——ドメインが違えば**無言で失敗する**。 */
-        ESP_LOGI(TAG, "climate toggle %s", entity.c_str());
-        this->call_homeassistant_service("climate.toggle", {{"entity_id", entity}});
-        break;
-
       case ActionKind::BEEP:
         /* ⚠️ ここで待たない。**鳴らし始めるだけ**で、止めるのは下の後始末。
            メインループで20ms待つと、その間HAの処理が全部止まる。 */
@@ -1010,6 +1003,16 @@ bool AstrolabeUI::climate_display_mode_(int slot, uint8_t *out) const {
   return true;
 }
 
+bool AstrolabeUI::climate_display_matches_running_() const {
+  uint8_t shown = 0;
+  if (!this->climate_display_mode_(this->app_slot_, &shown)) {
+    return false;
+  }
+  /* ⚠️ **報告が届いていないうちは「一致していない」と見なす。**
+     一致扱いにすると、届く前のタップが**いきなりオフを送る**ことになる。 */
+  return static_cast<uint8_t>(this->climate_app_.reported) == shown;
+}
+
 bool AstrolabeUI::climate_on_unsupported_mode_() const {
   if (this->app_slot_ < 0 || this->slots_[this->app_slot_].type != SlotType::CLIMATE) {
     return false;
@@ -1025,6 +1028,16 @@ void AstrolabeUI::climate_app_input_(Input in, uint32_t now) {
   if (in != Input::ROTATE_CW && in != Input::ROTATE_CCW) {
     return;
   }
+  /* ⚠️ **表示中モードが動作中と違うなら、回した時点でそのモードを送る**（C-CONTRACT2）。
+     ⚠️ **そのうえで温度も1目盛り動かす**（2026-08-11 ゆの決定）——
+     回したのに数字が動かない瞬間を作らないため。結果として温度も通常の間引きで飛ぶ。 */
+  if (!this->climate_display_matches_running_()) {
+    uint8_t shown = 0;
+    if (this->climate_display_mode_(this->app_slot_, &shown)) {
+      this->climate_send_mode_(shown, now);
+    }
+  }
+
   /* ⚠️ **刻みは機器に従う**（Y4）。届いていなければ0.5。
      実機には 1 の機器と 0.5 の機器が両方あった——固定にすると必ずどちらかと喧嘩する。 */
   const float reported_step = this->climate_step_[this->app_slot_].load();
@@ -1056,22 +1069,26 @@ void AstrolabeUI::climate_rotate_mode_(uint32_t now) {
     ESP_LOGD(TAG, "climate: no modes configured; long press refused");
     return;
   }
+  /* ⚠️ **長押しは一切送らない**（C-CONTRACT2・2026-08-11 ゆの）。
+     ここで動くのは**画面が指している場所だけ**。送るのはタップと回転の仕事。
+     ⚠️ だから**非対応のモードへも進める**——送らないので害が無く、
+     むしろ**そこから抜ける道**になっている。 */
   this->climate_cursor_sync_(this->app_slot_);
   this->climate_app_.cursor = static_cast<uint8_t>((this->climate_app_.cursor + 1) % modes.size());
   this->climate_app_.cursor_synced = true;
-  const uint8_t mode = modes[this->climate_app_.cursor];
   this->last_activity_ms_ = now;
   /* ⚠️ **他のどれとも違う音**（`light` の DIM⇔CLR と同じ位置づけ）。 */
   this->beep_(BEEP_HZ_MODE, BEEP_MS_MODE);
+  ESP_LOGI(TAG, "climate: show %s (not sent)", HVAC_MODE_NAMES[modes[this->climate_app_.cursor]]);
+}
 
+bool AstrolabeUI::climate_send_mode_(uint8_t mode, uint32_t now) {
   if (!this->climate_mode_supported_(this->app_slot_, mode)) {
-    /* ⚠️ **B'**: 並びからは外さない。**画面に「非対応」と出し、何も送らない。**
-       外して詰めると「書いたのに来ない」になり、送ると「切り替えたのに動かない」になる。
-       ⚠️ **音は鳴らす**——カーソルは動いているので、無音だと長押しを取りこぼしたように見える。 */
-    ESP_LOGI(TAG, "climate: mode %s not supported by this device; not sending", HVAC_MODE_NAMES[mode]);
-    return;
+    /* ⚠️ **持っていないモードは送らない**（B'）。呼ぶ側が既に無音で断っている前提だが、
+       **送信の入口でも止める**——ここが最後の砦。 */
+    ESP_LOGD(TAG, "climate: %s not supported; not sending", HVAC_MODE_NAMES[mode]);
+    return false;
   }
-
   Action a{};
   a.kind = ActionKind::SET_HVAC_MODE;
   a.slot = static_cast<uint8_t>(this->app_slot_);
@@ -1079,9 +1096,11 @@ void AstrolabeUI::climate_rotate_mode_(uint32_t now) {
   if (xQueueSend(this->action_queue_, &a, 0) != pdTRUE) {
     this->dropped_actions_.fetch_add(1);
     ESP_LOGW(TAG, "climate mode dropped: action queue full");
-    return;
+    return false;
   }
-  ESP_LOGI(TAG, "climate: mode -> %s", HVAC_MODE_NAMES[mode]);
+  this->last_activity_ms_ = now;
+  ESP_LOGI(TAG, "climate: send %s", HVAC_MODE_NAMES[mode]);
+  return true;
 }
 
 void AstrolabeUI::climate_app_publish_(uint32_t now) {
@@ -1388,19 +1407,23 @@ void AstrolabeUI::on_touch_short_(uint32_t now) {
           ESP_LOGD(TAG, "climate: mode not supported; tap ignored (silent)");
           return;
         }
-        /* ⚠️ **`climate.toggle` を呼ぶ。** `light.toggle` を流用しない——
-           ドメインが違えば**無言で失敗する**（実際にその不具合を踏んだ）。 */
-        this->last_activity_ms_ = now;
-        this->beep_(BEEP_HZ_ACTION);
-        Action a{};
-        a.kind = ActionKind::CLIMATE_TOGGLE;
-        a.slot = static_cast<uint8_t>(this->app_slot_);
-        if (xQueueSend(this->action_queue_, &a, 0) != pdTRUE) {
-          /* ⚠️ **黙って捨てない**（Y3）。診断に出る数を増やす。 */
-          this->dropped_actions_.fetch_add(1);
-          ESP_LOGW(TAG, "climate toggle dropped: action queue full");
+        /* ⚠️ **タップの意味は「表示中と動作中が一致しているか」で変わる**（C-CONTRACT2）:
+             一致  → **オフを送る**（もうそのモードで動いているので、次にすることは消すこと）
+             不一致 → **表示中モードを送る**（オフからの起動もここに入る）
+           ⚠️ **オフは `set_hvac_mode` で送る**——`climate.turn_off` は
+           `ClimateEntityFeature.TURN_OFF`(128) に依存するが、`set_hvac_mode` は
+           `hvac_modes` に `off` があれば必ず通る。 */
+        uint8_t shown = 0;
+        if (!this->climate_display_mode_(this->app_slot_, &shown)) {
+          ESP_LOGD(TAG, "climate: no modes configured; tap does nothing");
+          return;
         }
-        ESP_LOGI(TAG, "climate: toggle");
+        const uint8_t want =
+            this->climate_display_matches_running_() ? static_cast<uint8_t>(HvacMode::OFF) : shown;
+        this->last_activity_ms_ = now;
+        if (this->climate_send_mode_(want, now)) {
+          this->beep_(BEEP_HZ_ACTION);
+        }
         return;
       }
       /* アプリの中でのタップはトグル。 */
