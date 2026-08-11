@@ -36,6 +36,9 @@ static constexpr uint32_t CLIMATE_DIM_COLOR = 0x405060;
 static constexpr uint32_t CLIMATE_HINT_COLOR = 0x222222;
 /** ⚠️ **非対応の警告色。** 送らないことが見えている必要がある（B'）。 */
 static constexpr uint32_t CLIMATE_UNSUPPORTED_COLOR = 0xE04040;
+/** ⚠️ **非対応のときの円弧。** 灰に落として「いまは効かない」を色で言う
+ * （2026-08-11 ゆの「グレーアウトのアーク」）。 */
+static constexpr uint32_t CLIMATE_GRAYED_COLOR = 0x303538;
 
 /** 冷暖房に出すもの。⚠️ **描画は状態を持たない**——毎回これを渡し切る。 */
 struct ClimateView {
@@ -89,8 +92,11 @@ inline void render_climate(LGFX_Sprite *canvas, const ClimateView &v) {
   canvas->fillArc(CLIMATE_CX, CLIMATE_CY, CLIMATE_R_OUT, CLIMATE_R_IN, CLIMATE_ARC_START,
                   CLIMATE_ARC_START + CLIMATE_ARC_SWEEP, CLIMATE_TRACK_COLOR);
 
-  const uint32_t col = climate_mode_color(v.reported_name, v.is_on);
   const bool have_target = !std::isnan(v.target);
+  /* ⚠️ **非対応のときは灰に落とす。** 運転中の色（暖房＝橙 / 冷房＝青）で塗ると、
+     効いていないのに効いているように見える。 */
+  const uint32_t col =
+      v.mode_unsupported ? CLIMATE_GRAYED_COLOR : climate_mode_color(v.reported_name, v.is_on);
 
   if (have_target && v.have_range && v.max_temp > v.min_temp) {
     /* 設定温度の位置まで塗る。⚠️ **範囲は機器に従う**ので、目盛りは個体ごとに違う。 */
@@ -108,6 +114,28 @@ inline void render_climate(LGFX_Sprite *canvas, const ClimateView &v) {
   canvas->setFont(&fonts::efontCN_24);
   canvas->setTextSize(1.0f);
   char buf[16];
+
+  if (v.mode_unsupported) {
+    /* ⚠️ **非対応の面では、温度も室温も出さない。**
+       どちらも**いま動かせない値**で、出すと「効きそう」に見える。
+       代わりに**どのモードを指しているか**と、**なぜ効かないか**だけを出す。
+       ⚠️ 長押しだけが効くので、その案内は残す（下）。 */
+    canvas->setTextColor(CLIMATE_UNSUPPORTED_COLOR);
+    canvas->drawCenterString(v.mode_name != nullptr ? v.mode_name : "----", CLIMATE_CX, CLIMATE_CY - 34);
+    canvas->setTextSize(0.75f);
+    /* ⚠️ **2行に割る。** 1行だと縁で切れる。 */
+    canvas->drawCenterString("UNSUPPORTED", CLIMATE_CX, CLIMATE_CY + 2);
+    canvas->drawCenterString("MODE", CLIMATE_CX, CLIMATE_CY + 24);
+
+    canvas->setFont(&fonts::Font2);
+    canvas->setTextSize(1.0f);
+    canvas->setTextColor(CLIMATE_HINT_COLOR);
+    /* ⚠️ **効くのは長押しだけ。** ここから出る道を書いておく。 */
+    canvas->drawCenterString("hold: mode", CLIMATE_CX, 197);
+    canvas->drawCenterString("press: back", CLIMATE_CX, 210);
+    return;
+  }
+
   if (have_target) {
     /* ⚠️ **0.5刻みの機器があるので小数第1位まで出す。** 整数だけだと半目盛りが消える。 */
     snprintf(buf, sizeof(buf), "%.1f", static_cast<double>(v.target));
@@ -132,7 +160,7 @@ inline void render_climate(LGFX_Sprite *canvas, const ClimateView &v) {
   canvas->setFont(&fonts::efontCN_24);
   canvas->setTextSize(0.75f);
   if (v.mode_name != nullptr) {
-    canvas->setTextColor(v.mode_unsupported ? CLIMATE_UNSUPPORTED_COLOR : CLIMATE_TEXT_COLOR);
+    canvas->setTextColor(CLIMATE_TEXT_COLOR);
     canvas->drawCenterString(v.mode_name, CLIMATE_CX, CLIMATE_CY + 22);
   } else if (v.state_received && v.reported_name != nullptr) {
     /* `modes:` が書かれていないときは、**HAの報告をそのまま見せる**（動かせないが、読める）。 */
@@ -145,12 +173,6 @@ inline void render_climate(LGFX_Sprite *canvas, const ClimateView &v) {
 
   canvas->setFont(&fonts::Font2);
   canvas->setTextSize(1.0f);
-  if (v.mode_unsupported) {
-    /* ⚠️ **「この機器は持っていない」と言い切る。** 送っていないことが見えていないと、
-       「切り替えたのに動かない」に見える——それが一番分かりにくい壊れ方。 */
-    canvas->setTextColor(CLIMATE_UNSUPPORTED_COLOR);
-    canvas->drawCenterString("not supported", CLIMATE_CX, 184);
-  }
   canvas->setTextColor(CLIMATE_HINT_COLOR);
   /* ⚠️ **できることだけ案内する。** `modes:` が空なら長押しは効かないので書かない。 */
   if (v.mode_name != nullptr) {

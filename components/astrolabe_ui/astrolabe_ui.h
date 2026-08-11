@@ -470,6 +470,10 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
   /** ⚠️ **機器がそのモードを持っているか。** 届く前は「持っている」と答える——
    * 起動直後に赤字を出さないため。 */
   bool climate_mode_supported_(int slot, uint8_t mode) const;
+  /** ⚠️ **いま画面が「機器の持たないモード」を指しているか。**
+   * 指している間は**長押し以外を受け付けない**（2026-08-11 11:21 ゆの）。
+   * ⚠️ ノブの**ボタン（戻る）だけは通す**——止めるとこの画面から出られなくなる。 */
+  bool climate_on_unsupported_mode_() const;
   void climate_app_input_(Input in, uint32_t now);
   /** 長押しで `modes:` の並びを1つ進める。⚠️ **非対応でも並びから外さない**（B'）。 */
   void climate_rotate_mode_(uint32_t now);

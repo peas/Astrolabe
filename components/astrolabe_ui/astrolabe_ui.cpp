@@ -980,6 +980,17 @@ bool AstrolabeUI::climate_mode_supported_(int slot, uint8_t mode) const {
   return (mask & static_cast<uint16_t>(1u << mode)) != 0;
 }
 
+bool AstrolabeUI::climate_on_unsupported_mode_() const {
+  if (this->app_slot_ < 0 || this->slots_[this->app_slot_].type != SlotType::CLIMATE) {
+    return false;
+  }
+  const auto &modes = this->slots_[this->app_slot_].modes;
+  if (modes.empty() || this->climate_app_.cursor >= modes.size()) {
+    return false;
+  }
+  return !this->climate_mode_supported_(this->app_slot_, modes[this->climate_app_.cursor]);
+}
+
 void AstrolabeUI::climate_app_input_(Input in, uint32_t now) {
   if (in != Input::ROTATE_CW && in != Input::ROTATE_CCW) {
     return;
@@ -1045,6 +1056,15 @@ void AstrolabeUI::climate_rotate_mode_(uint32_t now) {
 
 void AstrolabeUI::climate_app_publish_(uint32_t now) {
   if (!this->climate_app_.publish_pending) {
+    return;
+  }
+  if (this->climate_on_unsupported_mode_()) {
+    /* ⚠️ **非対応のモードを指している間は、溜まっていた温度も捨てる。**
+       回した直後（間引きの120ms以内）に長押しで非対応へ移ると、
+       **何も受け付けないと言っておきながら温度だけ飛ぶ**——B'の
+       「そのモードにいる間は送信しない」を文字どおりに守る。 */
+    this->climate_app_.publish_pending = false;
+    ESP_LOGD(TAG, "climate: mode not supported; pending temperature dropped");
     return;
   }
   /* ⚠️ **間引きは `light` と同じ120ms。** カーテンだけが「静定してから最終値」で、
@@ -1327,6 +1347,14 @@ void AstrolabeUI::on_touch_short_(uint32_t now) {
         return;
       }
       if (this->app_slot_ >= 0 && this->slots_[this->app_slot_].type == SlotType::CLIMATE) {
+        if (this->climate_on_unsupported_mode_()) {
+          /* ⚠️ **非対応のモードを指している間は、長押し以外を受け付けない**
+             （2026-08-11 11:21 ゆの）。⚠️ **無音**——画面が「使えない」と言っているのに
+             音だけ返すと、効いたのか効かなかったのかが分からなくなる。 */
+          this->last_activity_ms_ = now;
+          ESP_LOGD(TAG, "climate: mode not supported; tap ignored (silent)");
+          return;
+        }
         /* ⚠️ **`climate.toggle` は実在する**（2026-08-11 にHAのサービス一覧で確認）。
            ライトのように「明るさを添えて turn_on」する必要が無いので、素直に投げる。 */
         this->last_activity_ms_ = now;
@@ -1361,6 +1389,19 @@ void AstrolabeUI::apply_input_(Input in, uint32_t now) {
   /* ⚠️ **ノブやボタンが来たら、進行中の接触は取り消す。**
      押しながら回すと選択が動くので、離した瞬間に**見えているのと違うスロット**が開く。 */
   this->cancel_touch_("input while touching");
+
+  /* ⚠️ **回転は「断ると分かっている場面」でだけ無音にする。**
+     ⚠️ ここに置くのは、**ブザーを1箇所に保ったまま**断るため——
+     画面ごとの分岐へ鳴らす処理を散らすと、下のコメントの失敗（書き忘れ）に戻る。
+     判定は述語1つに閉じてあるので、増えるのは条件であって分岐ではない。
+     ⚠️ **ボタン（戻る）は通す。** 止めるとこの画面から出られなくなる。
+     ⚠️ **無操作タイマは進める**——回すのは「使っている」ことなので、
+     手の中で時計へ落ちない方がよい（鳴らさず・値も動かさないことは変わらない）。 */
+  if ((in == Input::ROTATE_CW || in == Input::ROTATE_CCW) && this->climate_on_unsupported_mode_()) {
+    this->last_activity_ms_ = now;
+    ESP_LOGD(TAG, "climate: mode not supported; knob ignored (silent)");
+    return;
+  }
 
   /* ⚠️ **手応えは画面によらず、入力を受けた時点で鳴らす。**
      旧実装はハードウェアのコールバックで鳴らしていたので、
