@@ -165,6 +165,9 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
   static constexpr uint32_t LOCAL_CHANGE_GUARD_MS = 2000;
   /** 手応えの長さ。⚠️ **短くする**——「鳴った」と分かればよく、長いと操作の邪魔になる。 */
   static constexpr uint32_t BEEP_MS = 20;
+
+  /** Quanto tempo o "OK!" do quick-fire fica sobre o anel. */
+  static constexpr uint32_t QUICK_FIRE_BADGE_MS = 1000;
   /** 鳴らす強さ（デューティ）。 */
   static constexpr float BEEP_LEVEL = 0.5f;
 
@@ -208,6 +211,11 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
 
   /** いま出ている画面。⚠️ **描画タスクだけが持ち、描画タスクだけが変える。** */
   enum class Screen : uint8_t { LAUNCHER, CLOCK, APP };
+
+  /* Quick-fire badge — escrito e lido só na task de render (mesma thread
+     do open_app_/touch), então dispensa atomic. */
+  uint32_t quick_fire_at_ms_{0};
+  bool quick_fire_offline_{false};
 
   /** ⚠️ **メインループ → 描画タスクへ渡すのは「生の入力」であって「意図」ではない。**
    *

@@ -842,6 +842,8 @@ bool AstrolabeUI::open_app_(int index, uint32_t now) {
         }
         const bool online = this->api_connected_.load();
         this->beep_(online ? BEEP_HZ_ACTION : BEEP_HZ_OFFLINE, online ? BEEP_MS : BEEP_MS_MODE);
+        this->quick_fire_at_ms_ = now;
+        this->quick_fire_offline_ = !online;
         this->last_activity_ms_ = now;
         ESP_LOGI(TAG, "quick-fire: slot %d (generic, tap-only)", index);
         return true;
@@ -1901,6 +1903,21 @@ void AstrolabeUI::ui_task_() {
         /* ⚠️ `menu_->update()` は**アニメーションを進める**ので毎周期呼ぶ。
            時計にいる間は呼ばない——止めておけば、戻ったとき同じ盤面から再開する。 */
         this->menu_->update(now);
+        /* Feedback do quick-fire: um selo breve sobre o anel, depois some.
+           Offline é dito com todas as letras — beep grave sozinho não conta
+           a verdade de que nada foi enviado. */
+        if (this->quick_fire_at_ms_ != 0) {
+          if (now - this->quick_fire_at_ms_ < QUICK_FIRE_BADGE_MS) {
+            const bool off = this->quick_fire_offline_;
+            this->canvas_->fillSmoothCircle(120, 120, 44, off ? 0x5A5A5A : 0x1FA35C);
+            this->canvas_->setFont(&fonts::Font4);
+            this->canvas_->setTextDatum(textdatum_t::middle_center);
+            this->canvas_->setTextColor(0xFFFFFF);
+            this->canvas_->drawString(off ? "sem HA" : "OK!", 120, 120);
+          } else {
+            this->quick_fire_at_ms_ = 0;
+          }
+        }
         this->canvas_->pushSprite(0, 0);
         break;
 
