@@ -822,6 +822,30 @@ bool AstrolabeUI::open_app_(int index, uint32_t now) {
     }
 
     case SlotType::GENERIC: {
+      /* Quick-fire: a slot whose only configured gesture is `tap` has nothing
+         to show inside the app screen — opening it just costs the user a
+         second tap. Fire straight from the ring and stay on it. Slots with
+         hold/rotate still open, since those gestures need the screen. */
+      const auto &gs = this->slots_[index].gestures;
+      const bool only_tap = !gs[static_cast<uint8_t>(Gesture::TAP)].service.empty() &&
+                            gs[static_cast<uint8_t>(Gesture::HOLD)].service.empty() &&
+                            gs[static_cast<uint8_t>(Gesture::ROTATE_RIGHT)].service.empty() &&
+                            gs[static_cast<uint8_t>(Gesture::ROTATE_LEFT)].service.empty();
+      if (only_tap) {
+        Action a{};
+        a.kind = ActionKind::CALL_GESTURE;
+        a.slot = static_cast<uint8_t>(index);
+        a.gesture = static_cast<uint8_t>(Gesture::TAP);
+        if (xQueueSend(this->action_queue_, &a, 0) != pdTRUE) {
+          this->dropped_actions_.fetch_add(1);
+          ESP_LOGW(TAG, "gesture dropped: action queue full");
+        }
+        const bool online = this->api_connected_.load();
+        this->beep_(online ? BEEP_HZ_ACTION : BEEP_HZ_OFFLINE, online ? BEEP_MS : BEEP_MS_MODE);
+        this->last_activity_ms_ = now;
+        ESP_LOGI(TAG, "quick-fire: slot %d (generic, tap-only)", index);
+        return true;
+      }
       /* ⚠️ **状態を持たないアプリ。** 購読も無く、開いた時点で出すものは見出しだけ。 */
       this->generic_app_ = GenericAppState{};
       /* ⚠️ ゼロ値は `Gesture::TAP`。**「何も撃っていない」を明示する。** */

@@ -137,7 +137,7 @@ class AstrolabeUI : public Component, public api::CustomAPIDevice {
   static constexpr uint32_t CLOCK_RENDER_MS = 500;
 
   /** 明るさの1目盛り。 */
-  static constexpr int BRIGHTNESS_STEP = 8;
+  static constexpr int BRIGHTNESS_STEP = 10;
   /** カーテンの1目盛り（%）。 */
   static constexpr int COVER_POSITION_STEP = 5;
   /** ⚠️ **カーテンだけ送信の方針が違う。** 回している間は送らず、
